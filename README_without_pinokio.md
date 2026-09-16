@@ -183,7 +183,7 @@ pyenv versions
 
 **推荐 Python 3.10**，最低也是 3.10。依据：
 
-- **最低 3.10**：代码使用了 `str | None` 类型语法（`app/generate_personas.py`），3.9 及以下无法运行；
+- **最低 3.10**：代码使用了 `str | None` 类型语法（`app/generate_personas.py`），且 `app/requirements.txt` 中的 `peft==0.18.1` 声明 `requires-python >= 3.10.0` —— 3.9 及以下无法运行；
 - **推荐 3.10**：与 Pinokio 官方流程完全对齐 —— `torch.js` 提供的预编译轮子、以及可选的 flash-attention wheel 都是 **`cp310`**（[5.3](#53-可选flash-attention仅-nvidia)）；
 - **3.11 也能用**（`torch==2.7.0` 支持 3.9–3.13），但**拿不到预编译的 flash-attention**，只能跳过或自行从源码编译；
 - **避开 3.12+**：PyTorch 2.7 虽然支持，但 `qwen-tts` / `transformers` 组合未经本项目验证。
@@ -247,10 +247,26 @@ pip install qwen-tts==0.1.1
 # 3) PyTorch —— 最后装，见 5.2
 ```
 
-> `app/requirements.txt` 中**不含 torch**，它由平台的 wheel 索引决定，必须单独安装。
+> `app/requirements.txt` 里**没有直接列出 torch**，但它会被 `peft` / `qwen-tts` 作为传递依赖装上 —— 只是默认拉到的是通用轮子，**用 GPU 的话需要按 5.2 重装成对应平台的版本**。
 > `install.js` 还会先执行一次 `uv pip uninstall google-genai` 来避免依赖冲突；如果你是全新环境可以忽略。
 
 ### 5.2 安装 PyTorch（按平台二选一）
+
+> **⚠️ 只用远程 LLM + `external` TTS 模式？本节可以跳过。**
+>
+> `peft==0.18.1`（在 `app/requirements.txt` 里）硬依赖 `torch>=1.13.0`，`qwen-tts` 依赖 `torchaudio` —— 所以 `pip install -r app/requirements.txt` 会**自动**装上 PyPI 的默认轮子。macOS 上这就是正确的版本，无需挑索引、无需 `--force-reinstall`。
+>
+> 而且**不能卸载它**：`app/tts.py` 的 `_clear_gpu_cache()` 里有一处**无保护**的 `import torch`（在 `try` 之外），而 `external` 模式的批处理每处理完一组音色都会调用它 —— 删掉 torch 会让批次直接崩。
+>
+> | 在 `external` 模式下…… | 状态 |
+> |---|---|
+> | 剧本生成 / 审阅（`generate_script.py`，只用 `openai`） | ✅ 不碰 torch |
+> | Custom Voice / Clone Voice 生成（远端 Gradio） | ✅ 不碰 torch |
+> | GPU 状态面板（`get_gpu_stats`） | ✅ 有 `except ImportError` 保护，显示为空 |
+> | 拼接 / MP3 / M4B / Audacity 导出（`project.py`） | ✅ 只用 pydub + ffmpeg |
+> | 语音设计、Persona 生成、LoRA 训练、内置 LoRA 音色 | ❌ 需要**本地** Qwen3-TTS 模型，无法使用 |
+>
+> 如果你确实要用上面最后一行那些功能，就需要按本节装好平台对应的 torch，并切回 `local` 模式。
 
 与 `torch.js` 一致：**最后安装，`--force-reinstall --no-deps` 覆盖掉 `qwen-tts` 可能拉进来的版本**。
 
