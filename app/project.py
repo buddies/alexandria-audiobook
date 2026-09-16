@@ -13,6 +13,8 @@ from tts import (
     TTSEngine,
     combine_audio_with_pauses,
     compute_timeline,
+    prepare_segment_for_join,
+    resolve_join_config,
     sanitize_filename,
     DEFAULT_PAUSE_MS,
     SAME_SPEAKER_PAUSE_MS
@@ -21,18 +23,45 @@ from pydub import AudioSegment
 
 MAX_CHUNK_CHARS = 500
 
+# Punctuation that closes a sentence - a chunk ending in one of these is a
+# complete sentence, so the next entry is a new line rather than a continuation.
+_SENTENCE_END_CHARS = "。！？!?.\"'”）」』\u201d\u2019\u2026"
+# Punctuation that explicitly leaves a sentence unfinished: the next entry of the
+# same speaker is the second half of the same sentence and must be one take.
+_HANGING_CHARS = "，,、；;：:—–-⋯‥\u2026"
+# A short fragment with no closing punctuation at all is structural (chapter
+# title, heading, dedication) and must never be merged away.
+_CLOSING_CHARS = _SENTENCE_END_CHARS + _HANGING_CHARS
+
+
 def get_speaker(entry):
     """Get speaker from entry, checking both 'speaker' and 'type' fields."""
     return entry.get("speaker") or entry.get("type") or ""
 
 
+def _is_hanging(text):
+    """True when the text is explicitly left unfinished (ends with ，—…… etc.)."""
+    stripped = (text or "").strip()
+    return bool(stripped) and stripped[-1] in _HANGING_CHARS
+
+
+def _instruct_key(instruct):
+    """Normalize an instruct string so trivial wording differences still match."""
+    return re.sub(r"\s+", " ", (instruct or "").strip().lower()).rstrip(".")
+
+
 def _is_structural_text(text):
-    """Check if text is a title, chapter heading, dedication, or other structural fragment."""
+    """Check if text is a title, chapter heading, dedication, or other structural fragment.
+
+    Only *unpunctuated* short fragments count: CJK sentence enders (。！？) must be
+    recognized, otherwise every short Chinese line looks like a heading and lines
+    of the same speaker never merge.
+    """
     stripped = text.strip()
     if not stripped:
         return True
-    # Very short and not a full sentence (no sentence-ending punctuation)
-    if len(stripped) < 80 and not stripped[-1] in '.!?':
+    # Very short and with no closing punctuation at all
+    if len(stripped) < 80 and stripped[-1] not in _CLOSING_CHARS:
         return True
     return False
 
@@ -45,8 +74,23 @@ def _make_chunk(speaker, text, instruct, pause_after=None):
     return chunk
 
 
-def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS):
-    """Group consecutive entries by same speaker into chunks up to max_chars"""
+def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS, merge_mid_sentence=True,
+                      merge_same_speaker=False):
+    """Group consecutive entries by same speaker into chunks up to max_chars.
+
+    Merge policy matters for voice consistency: every chunk becomes its own TTS
+    request, and independently sampled takes of the same voice drift apart. Two
+    extra rules keep one continuous utterance in a single take:
+
+    - ``merge_mid_sentence``: merge even when the instruct differs, as long as
+      the current text has not finished its sentence (the line was split mid
+      sentence by an attribution/narration tag part-way through).
+    - ``merge_same_speaker``: merge any consecutive entries of the same speaker
+      regardless of instruct wording. Strongest consistency, loses per-line
+      emotion direction.
+
+    When entries are merged the *first* entry's instruct wins.
+    """
     if not script_entries:
         return []
 
@@ -61,20 +105,19 @@ def group_into_chunks(script_entries, max_chars=MAX_CHUNK_CHARS):
         text = entry.get("text", "")
         instruct = entry.get("instruct", "")
 
-        # Don't merge structural text (titles, chapter headings, dedications)
-        if (speaker == current_speaker and instruct == current_instruct
-                and not _is_structural_text(current_text)
-                and not _is_structural_text(text)):
-            combined = current_text + " " + text
-            if len(combined) <= max_chars:
-                current_text = combined
-                # Last merged entry's pause_after wins
-                current_pause_after = entry.get("pause_after", current_pause_after)
-            else:
-                chunks.append(_make_chunk(current_speaker, current_text, current_instruct, current_pause_after))
-                current_text = text
-                current_instruct = instruct
-                current_pause_after = entry.get("pause_after")
+        same_speaker = speaker == current_speaker
+        carry_over = merge_mid_sentence and _is_hanging(current_text) and not _is_structural_text(text)
+        instruct_matches = _instruct_key(instruct) == _instruct_key(current_instruct)
+        both_structural_safe = (not _is_structural_text(current_text)
+                                and not _is_structural_text(text))
+        fits = len(current_text) + 1 + len(text) <= max_chars
+
+        if (same_speaker and fits and both_structural_safe
+                and (instruct_matches or carry_over or merge_same_speaker)):
+            # Instruct of the merged chunk stays the first entry's wording.
+            current_text = current_text + " " + text
+            # Last merged entry's pause_after wins
+            current_pause_after = entry.get("pause_after", current_pause_after)
         else:
             chunks.append(_make_chunk(current_speaker, current_text, current_instruct, current_pause_after))
             current_speaker = speaker
@@ -126,12 +169,24 @@ class ProjectManager:
             return None
 
     def _load_tts_config(self):
-        """Load TTS config section from config.json for pause defaults."""
+        """Load TTS config section from config.json for pause defaults, join settings, etc."""
         try:
             with open(self.config_path, "r", encoding="utf-8") as f:
                 return json.load(f).get("tts", {})
         except Exception:
             return {}
+
+    def _load_generation_config(self):
+        """Load the generation config section from config.json."""
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                return json.load(f).get("generation", {}) or {}
+        except Exception:
+            return {}
+
+    def _load_join_config(self):
+        """Join-smoothing settings (silence trim / level match / fades) for merges."""
+        return self._load_tts_config().get("join")
 
     def model_downloads_enabled(self):
         """Whether model weights may be pulled from HuggingFace.
@@ -161,7 +216,18 @@ class ProjectManager:
                 print(f"WARNING: annotated_script.json is also corrupted ({e}). Starting with empty chunks.")
                 return []
 
-            chunks = group_into_chunks(script)
+            gen_cfg = self._load_generation_config()
+            try:
+                max_chunk_chars = int(gen_cfg.get("max_chunk_chars") or MAX_CHUNK_CHARS)
+            except (TypeError, ValueError):
+                max_chunk_chars = MAX_CHUNK_CHARS
+
+            chunks = group_into_chunks(
+                script,
+                max_chars=max(80, max_chunk_chars),
+                merge_mid_sentence=bool(gen_cfg.get("merge_mid_sentence", True)),
+                merge_same_speaker=bool(gen_cfg.get("merge_same_speaker", False)),
+            )
 
             # Initialize chunk status
             for i, chunk in enumerate(chunks):
@@ -431,7 +497,14 @@ class ProjectManager:
         )
 
     def _load_chunks_with_audio(self):
-        """Load chunks and pair each with its AudioSegment. Returns list of (chunk, segment)."""
+        """Load chunks and pair each with its AudioSegment. Returns list of (chunk, segment).
+
+        Each segment is normalized for joining (silence trimmed, level matched)
+        so the merged book does not jump in loudness or double up TTS silence.
+        Normalizing here - the single entry point for merge/M4B/export - keeps
+        the computed timeline and the concatenated audio in sync.
+        """
+        join_config = resolve_join_config(self._load_join_config())
         chunks = self.load_chunks()
         result = []
         for chunk in chunks:
@@ -443,6 +516,7 @@ class ProjectManager:
                 continue
             try:
                 segment = AudioSegment.from_file(full_path)
+                segment = prepare_segment_for_join(segment, join_config)
                 result.append((chunk, segment))
             except Exception as e:
                 print(f"Error loading audio segment {path}: {e}")
@@ -462,7 +536,8 @@ class ProjectManager:
         pause_overrides = [chunk.get("pause_after") for chunk, _, _ in timeline]
 
         final_audio = combine_audio_with_pauses(
-            audio_segments, speakers, pause_ms, same_speaker_pause_ms, pause_overrides
+            audio_segments, speakers, pause_ms, same_speaker_pause_ms, pause_overrides,
+            join_config=self._load_join_config()
         )
         output_filename = "cloned_audiobook.mp3"
         output_path = os.path.join(self.root_dir, output_filename)
@@ -581,7 +656,8 @@ class ProjectManager:
         speakers = [chunk["speaker"] for chunk, _, _ in timeline]
         pause_overrides = [chunk.get("pause_after") for chunk, _, _ in timeline]
         final_audio = combine_audio_with_pauses(
-            audio_segments, speakers, pause_ms, same_speaker_pause_ms, pause_overrides
+            audio_segments, speakers, pause_ms, same_speaker_pause_ms, pause_overrides,
+            join_config=self._load_join_config()
         )
 
         temp_wav = os.path.join(self.root_dir, "temp_m4b_combined.wav")

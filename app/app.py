@@ -8,7 +8,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTa
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
 import re
 import time
@@ -213,6 +213,22 @@ class LLMConfig(BaseModel):
     api_key: str
     model_name: str
 
+class JoinConfig(BaseModel):
+    """Post-processing applied to every chunk before chunks are spliced together.
+
+    Each chunk is an independent TTS take, so without this the merged book shows
+    audible seams: doubled silence, level jumps and hard cuts that make one
+    voice sound like several different speakers.
+    """
+    trim_silence: bool = True  # strip the TTS lead/tail silence
+    silence_threshold_db: float = -45.0
+    keep_head_ms: int = 40  # padding kept so speech onsets keep their attack
+    keep_tail_ms: int = 80
+    match_loudness: bool = True  # gain-match every chunk to one common level
+    target_dbfs: float = -20.0
+    max_gain_db: float = 12.0  # never boost/cut more than this
+    fade_ms: int = 25  # de-click fade at every join
+
 class TTSConfig(BaseModel):
     mode: str = "local"  # "local" or "external"
     url: str = "http://127.0.0.1:7860"  # external mode only (base URL of the TTS server)
@@ -222,6 +238,8 @@ class TTSConfig(BaseModel):
     language: str = "English"  # TTS language
     parallel_workers: int = 2  # concurrent TTS workers
     batch_seed: Optional[int] = None  # Single seed for batch mode, None/-1 = random
+    deterministic_seed: bool = True  # reuse one stable seed per speaker across chunks
+    instruct_style: str = "full"  # emotion direction sent per line: full | first_clause | voice_style
     compile_codec: bool = False  # torch.compile the codec for ~3-4x batch throughput (slow first run)
     sub_batch_enabled: bool = True  # split batch by text length to reduce padding waste
     sub_batch_min_size: int = 4  # minimum chunks per sub-batch before allowing a split
@@ -230,6 +248,7 @@ class TTSConfig(BaseModel):
     batch_group_by_type: bool = False  # group chunks by voice type for efficient batching
     pause_between_speakers_ms: int = 500  # silence (ms) between different speakers during merge
     pause_same_speaker_ms: int = 250  # silence (ms) when same speaker continues during merge
+    join: JoinConfig = Field(default_factory=JoinConfig)  # splice smoothing for merged audio
 
 class GenerationConfig(BaseModel):
     chunk_size: int = 3000
@@ -241,6 +260,9 @@ class GenerationConfig(BaseModel):
     presence_penalty: float = 0.0
     banned_tokens: List[str] = []
     merge_narrators: bool = False
+    merge_mid_sentence: bool = True  # keep a sentence split mid-way in one TTS take
+    merge_same_speaker: bool = False  # merge any consecutive lines of the same speaker
+    max_chunk_chars: int = 500  # upper bound on characters per TTS chunk
 
 class PromptConfig(BaseModel):
     system_prompt: Optional[str] = None

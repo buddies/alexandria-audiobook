@@ -167,10 +167,26 @@
                                 <input type="number" class="form-control" id="parallel-workers" value="2" min="1">
                                 <div class="form-text">Concurrent TTS requests</div>
                             </div>
+                            <div class="col-md-3">
+                                <label class="form-label">Emotion Direction Per Line</label>
+                                <select class="form-select" id="instruct-style">
+                                    <option value="full">Full instruct (most expressive)</option>
+                                    <option value="first_clause">First clause only (balanced)</option>
+                                    <option value="voice_style">Voice style only (most consistent)</option>
+                                </select>
+                                <div class="form-text">How much of each line's emotion direction is sent to the engine. Long, differently-worded instructions per line are the main cause of the same voice sounding like a different person between chunks.</div>
+                            </div>
                             <div class="col-md-2">
                                 <label class="form-label">Batch Seed</label>
                                 <input type="number" class="form-control" id="batch-seed" placeholder="-1 (random)">
                                 <div class="form-text">Seed for reproducibility</div>
+                            </div>
+                            <div class="col-md-2">
+                                <div class="form-check form-switch mt-4">
+                                    <input class="form-check-input" type="checkbox" id="deterministic-seed" checked>
+                                    <label class="form-check-label" for="deterministic-seed">Stable Voice Seed</label>
+                                </div>
+                                <div class="form-text">Reuse one fixed seed per speaker so repeated takes of the same voice don't drift into a different-sounding person</div>
                             </div>
                         </div>
                         <div class="row mb-3" id="tts-local-options" style="display:none;">
@@ -221,6 +237,32 @@
                                 <label class="form-label">Same Speaker Pause (ms)</label>
                                 <input type="number" class="form-control" id="pause-same-speaker" value="250" min="0" step="50">
                                 <div class="form-text">Silence when same speaker continues on merge</div>
+                            </div>
+                        </div>
+                        <div class="row mb-3">
+                            <div class="col-md-2">
+                                <div class="form-check form-switch mt-4">
+                                    <input class="form-check-input" type="checkbox" id="join-trim-silence" checked>
+                                    <label class="form-check-label" for="join-trim-silence">Trim Chunk Silence</label>
+                                </div>
+                                <div class="form-text">Strip the head/tail silence every TTS take adds, so pauses stay even</div>
+                            </div>
+                            <div class="col-md-2">
+                                <div class="form-check form-switch mt-4">
+                                    <input class="form-check-input" type="checkbox" id="join-match-loudness" checked>
+                                    <label class="form-check-label" for="join-match-loudness">Match Chunk Loudness</label>
+                                </div>
+                                <div class="form-text">Gain-match every chunk to one level — removes volume jumps at joins</div>
+                            </div>
+                            <div class="col-md-2">
+                                <label class="form-label">Target Level (dBFS)</label>
+                                <input type="number" class="form-control" id="join-target-dbfs" value="-20" min="-40" max="-10" step="0.5">
+                                <div class="form-text">Average loudness every chunk is matched to</div>
+                            </div>
+                            <div class="col-md-2">
+                                <label class="form-label">Join Fade (ms)</label>
+                                <input type="number" class="form-control" id="join-fade-ms" value="25" min="0" max="500" step="5">
+                                <div class="form-text">Short de-click fade on both sides of each join (0 = off)</div>
                             </div>
                         </div>
 
@@ -280,6 +322,23 @@
                                 <input class="form-check-input" type="checkbox" id="merge-narrators">
                                 <label class="form-check-label" for="merge-narrators">Merge consecutive narrator lines</label>
                                 <div class="form-text">During script review, combine adjacent NARRATOR entries that share the same instruct into a single longer entry. Disable for better per-line voice direction control.</div>
+                            </div>
+                            <div class="mb-3 form-check form-switch">
+                                <input class="form-check-input" type="checkbox" id="merge-mid-sentence" checked>
+                                <label class="form-check-label" for="merge-mid-sentence">Keep mid-sentence splits in one take</label>
+                                <div class="form-text">When a sentence is broken up by an inserted narration/attribution tag, synthesize both halves as one request instead of two independent takes. Applies when chunks are (re)built from the script.</div>
+                            </div>
+                            <div class="mb-3 form-check form-switch">
+                                <input class="form-check-input" type="checkbox" id="merge-same-speaker">
+                                <label class="form-check-label" for="merge-same-speaker">Always merge consecutive same-speaker lines</label>
+                                <div class="form-text">Merge any back-to-back lines of the same speaker even when their emotion direction differs (the first line's instruct wins). Maximum voice consistency, less per-line emotion control.</div>
+                            </div>
+                            <div class="row mb-3">
+                                <div class="col-md-6">
+                                    <label class="form-label">Max Chunk Characters</label>
+                                    <input type="number" class="form-control" id="max-chunk-chars" value="500" min="80" step="50">
+                                    <div class="form-text">Upper bound on characters per TTS chunk. Larger = fewer independent takes = more consistent voice, slightly longer requests. Applies when chunks are (re)built from the script.</div>
+                                </div>
                             </div>
                             <hr>
                             <h6 class="mb-3">Prompt Customization</h6>
@@ -1194,6 +1253,17 @@
                 if (config.tts.batch_seed != null) {
                     document.getElementById('batch-seed').value = config.tts.batch_seed;
                 }
+                document.getElementById('deterministic-seed').checked = config.tts.deterministic_seed !== false;
+                document.getElementById('instruct-style').value = config.tts.instruct_style || 'full';
+                const joinCfg = config.tts.join || {};
+                document.getElementById('join-trim-silence').checked = joinCfg.trim_silence !== false;
+                document.getElementById('join-match-loudness').checked = joinCfg.match_loudness !== false;
+                if (joinCfg.target_dbfs != null) {
+                    document.getElementById('join-target-dbfs').value = joinCfg.target_dbfs;
+                }
+                if (joinCfg.fade_ms != null) {
+                    document.getElementById('join-fade-ms').value = joinCfg.fade_ms;
+                }
                 document.getElementById('compile-codec').checked = !!config.tts.compile_codec;
                 document.getElementById('batch-group-by-type').checked = !!config.tts.batch_group_by_type;
                 document.getElementById('sub-batch-enabled').checked = config.tts.sub_batch_enabled !== false;
@@ -1291,6 +1361,11 @@
                         document.getElementById('banned-tokens').value = config.generation.banned_tokens.join(', ');
                     }
                     document.getElementById('merge-narrators').checked = !!config.generation.merge_narrators;
+                    document.getElementById('merge-mid-sentence').checked = config.generation.merge_mid_sentence !== false;
+                    document.getElementById('merge-same-speaker').checked = !!config.generation.merge_same_speaker;
+                    if (config.generation.max_chunk_chars != null) {
+                        document.getElementById('max-chunk-chars').value = config.generation.max_chunk_chars;
+                    }
                 }
 
                 // Show previously loaded file
@@ -1337,6 +1412,9 @@
             document.getElementById('presence-penalty').value = 0;
             document.getElementById('banned-tokens').value = '';
             document.getElementById('merge-narrators').checked = false;
+            document.getElementById('merge-mid-sentence').checked = true;
+            document.getElementById('merge-same-speaker').checked = false;
+            document.getElementById('max-chunk-chars').value = 500;
         };
 
         // Toggle chevron on collapse
@@ -1371,6 +1449,8 @@
                     language: document.getElementById('tts-language').value,
                     parallel_workers: parallelWorkers,
                     batch_seed: document.getElementById('batch-seed').value ? parseInt(document.getElementById('batch-seed').value) : null,
+                    deterministic_seed: document.getElementById('deterministic-seed').checked,
+                    instruct_style: document.getElementById('instruct-style').value,
                     compile_codec: document.getElementById('compile-codec').checked,
                     batch_group_by_type: document.getElementById('batch-group-by-type').checked,
                     sub_batch_enabled: document.getElementById('sub-batch-enabled').checked,
@@ -1378,7 +1458,13 @@
                     sub_batch_ratio: parseFloat(document.getElementById('sub-batch-ratio').value) || 5,
                     sub_batch_max_items: parseInt(document.getElementById('sub-batch-max-items').value) || 0,
                     pause_between_speakers_ms: parseInt(document.getElementById('pause-between-speakers').value) || 500,
-                    pause_same_speaker_ms: parseInt(document.getElementById('pause-same-speaker').value) || 250
+                    pause_same_speaker_ms: parseInt(document.getElementById('pause-same-speaker').value) || 250,
+                    join: {
+                        trim_silence: document.getElementById('join-trim-silence').checked,
+                        match_loudness: document.getElementById('join-match-loudness').checked,
+                        target_dbfs: parseFloat(document.getElementById('join-target-dbfs').value) || -20,
+                        fade_ms: parseInt(document.getElementById('join-fade-ms').value) || 0
+                    }
                 },
                 prompts: {
                     system_prompt: document.getElementById('system-prompt').value,
@@ -1400,7 +1486,10 @@
                     banned_tokens: document.getElementById('banned-tokens').value
                         ? document.getElementById('banned-tokens').value.split(',').map(t => t.trim()).filter(t => t)
                         : [],
-                    merge_narrators: document.getElementById('merge-narrators').checked
+                    merge_narrators: document.getElementById('merge-narrators').checked,
+                    merge_mid_sentence: document.getElementById('merge-mid-sentence').checked,
+                    merge_same_speaker: document.getElementById('merge-same-speaker').checked,
+                    max_chunk_chars: parseInt(document.getElementById('max-chunk-chars').value) || 500
                 }
             };
             try {
@@ -1634,6 +1723,7 @@
                                             <input type="text" class="form-control character-style" placeholder="Character style (e.g. refined aristocratic tone, heavy Scottish accent)" value="${escapeHtml(config.character_style || config.default_style || '')}">
                                         </div>
                                     </div>
+                                    <div class="form-text">Voice identity anchor. Keep it identical for every line of this speaker (timbre/age/accent) — it is appended to each line's emotion direction so the voice stays the same person across chunks. Write it in the TTS language.</div>
                                 </div>
 
                                 <!-- Built-in LoRA Options -->

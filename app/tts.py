@@ -3,12 +3,158 @@ import re
 import json
 import threading
 import shutil
+import zlib
 import numpy as np
 import soundfile as sf
 from pydub import AudioSegment
 
 DEFAULT_PAUSE_MS = 500  # Pause between different speakers
 SAME_SPEAKER_PAUSE_MS = 250  # Shorter pause for same speaker continuing
+
+# ── Join smoothing ───────────────────────────────────────────────
+# Every chunk is synthesized by an independent TTS request, so the raw WAVs
+# differ in lead/tail silence and in average level. Splicing them naively is
+# what makes a single voice sound like it changes person mid-scene.
+DEFAULT_JOIN_CONFIG = {
+    "trim_silence": True,        # remove the TTS lead/tail silence
+    "silence_threshold_db": -45.0,
+    "keep_head_ms": 40,          # padding kept so speech onsets keep their attack
+    "keep_tail_ms": 80,
+    "match_loudness": True,      # gain-match every segment to one common level
+    "target_dbfs": -20.0,
+    "max_gain_db": 12.0,         # never boost/cut more than this
+    "fade_ms": 25,               # de-click fade at every join
+}
+
+
+def resolve_join_config(raw):
+    """Merge a user-supplied join config over DEFAULT_JOIN_CONFIG.
+
+    Unknown keys are ignored and values are coerced to the type of the default,
+    so a partially-filled or hand-edited config.json never breaks a merge.
+    """
+    cfg = dict(DEFAULT_JOIN_CONFIG)
+    if not isinstance(raw, dict):
+        return cfg
+    for key, default in DEFAULT_JOIN_CONFIG.items():
+        if key not in raw or raw[key] is None:
+            continue
+        value = raw[key]
+        try:
+            if isinstance(default, bool):
+                if isinstance(value, str):
+                    cfg[key] = value.strip().lower() not in ("", "0", "false", "no", "off")
+                else:
+                    cfg[key] = bool(value)
+            elif isinstance(default, int) and not isinstance(default, bool):
+                cfg[key] = int(float(value))
+            else:
+                cfg[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return cfg
+
+
+def trim_segment_silence(segment, threshold_db=-45.0, keep_head_ms=40, keep_tail_ms=80):
+    """Trim lead/tail silence from one TTS segment, keeping a short padding.
+
+    TTS adds 100-400 ms of silence to most segments; stacking that on top of the
+    configured pause produces an uneven, chopped-up reading.
+
+    Implemented with numpy instead of pydub's detect_nonsilent(), which does not
+    exist in older pydub releases (0.23.x and below).
+    """
+    if segment is None or len(segment) == 0:
+        return segment
+    try:
+        samples = np.asarray(segment.get_array_of_samples(), dtype=np.float32)
+        if segment.channels and segment.channels > 1:
+            samples = samples.reshape(-1, segment.channels).mean(axis=1)
+        if samples.size == 0:
+            return segment
+
+        window = max(1, int(segment.frame_rate * 0.01))  # 10 ms envelope windows
+        n_windows = samples.size // window
+        if n_windows == 0:
+            return segment
+
+        envelope = np.abs(samples[:n_windows * window]).reshape(n_windows, window).max(axis=1)
+        peak = float(envelope.max())
+        if peak <= 0:
+            return segment  # all silence, nothing to keep
+
+        full_scale = float(1 << (8 * segment.sample_width - 1))
+        # Absolute dBFS threshold, but never stricter than 10% of this segment's
+        # own peak (a quiet take would otherwise look "all silence").
+        threshold = min(full_scale * (10 ** (float(threshold_db) / 20.0)), peak * 0.1)
+        loud = np.nonzero(envelope > threshold)[0]
+        if loud.size == 0:
+            return segment
+
+        start_ms = int(loud[0] * window / segment.frame_rate * 1000) - int(keep_head_ms)
+        end_ms = int((loud[-1] + 1) * window / segment.frame_rate * 1000) + int(keep_tail_ms)
+        start_ms = max(0, start_ms)
+        end_ms = min(len(segment), end_ms)
+        if end_ms <= start_ms:
+            return segment
+        return segment[start_ms:end_ms]
+    except Exception as e:
+        print(f"Warning: silence trim failed ({e}); keeping segment as-is")
+        return segment
+
+
+def match_segment_level(segment, target_dbfs=-20.0, max_gain_db=12.0):
+    """Gain-match one segment towards a common average level.
+
+    Keeps the whole book at a consistent perceived volume so consecutive takes
+    of the same voice no longer jump in loudness at the join.
+    """
+    if segment is None or len(segment) == 0:
+        return segment
+    try:
+        current_db = segment.dBFS
+        peak_db = segment.max_dBFS
+    except Exception:
+        return segment
+    if current_db == float("-inf") or peak_db == float("-inf"):
+        return segment  # pure silence, nothing to match
+    gain = float(target_dbfs) - current_db
+    gain = max(-abs(float(max_gain_db)), min(abs(float(max_gain_db)), gain))
+    # Never push the peak above -1 dBFS (avoids clipping on loud takes).
+    gain = min(gain, -1.0 - peak_db)
+    if abs(gain) < 0.1:
+        return segment
+    return segment.apply_gain(gain)
+
+
+def prepare_segment_for_join(segment, join_config=None):
+    """Normalize one chunk's audio before it is spliced into the timeline."""
+    cfg = resolve_join_config(join_config)
+    if cfg["trim_silence"]:
+        segment = trim_segment_silence(
+            segment,
+            threshold_db=cfg["silence_threshold_db"],
+            keep_head_ms=cfg["keep_head_ms"],
+            keep_tail_ms=cfg["keep_tail_ms"],
+        )
+    if cfg["match_loudness"]:
+        segment = match_segment_level(
+            segment,
+            target_dbfs=cfg["target_dbfs"],
+            max_gain_db=cfg["max_gain_db"],
+        )
+    return segment
+
+
+def stable_seed_for_speaker(speaker):
+    """Deterministic seed derived from a speaker name.
+
+    Two takes of the same voice then share the same initial noise sequence, so
+    timbre, pitch and pacing stay close across independently generated segments
+    instead of being re-rolled randomly on every request.
+    """
+    key = f"alexandria-tts::{speaker or ''}"
+    return zlib.crc32(key.encode("utf-8")) % (2 ** 31 - 1)
 
 
 def sanitize_filename(name):
@@ -19,21 +165,37 @@ def sanitize_filename(name):
 
 def combine_audio_with_pauses(audio_segments, speakers, pause_ms=DEFAULT_PAUSE_MS,
                               same_speaker_pause_ms=SAME_SPEAKER_PAUSE_MS,
-                              pause_overrides=None):
+                              pause_overrides=None, join_config=None):
     """Combine audio segments with pauses between them.
 
     Args:
         pause_overrides: Optional list aligned with audio_segments. Each entry is
             the pause (ms) to insert *after* that segment, or None to use the
             default speaker-change logic. The last entry is ignored.
+        join_config: Optional dict (see DEFAULT_JOIN_CONFIG). Only the fade_ms
+            key is used here; silence trimming / level matching happen earlier
+            in ``prepare_segment_for_join`` so the timeline stays accurate.
     """
     if not audio_segments:
         return None
 
-    combined = audio_segments[0]
+    segments = list(audio_segments)
+    fade_ms = int(resolve_join_config(join_config)["fade_ms"])
+    if fade_ms > 0 and len(segments) > 1:
+        last_index = len(segments) - 1
+        faded = []
+        for i, segment in enumerate(segments):
+            if i > 0:
+                segment = segment.fade_in(fade_ms)
+            if i < last_index:
+                segment = segment.fade_out(fade_ms)
+            faded.append(segment)
+        segments = faded
+
+    combined = segments[0]
     prev_speaker = speakers[0]
 
-    for i, (segment, speaker) in enumerate(zip(audio_segments[1:], speakers[1:])):
+    for i, (segment, speaker) in enumerate(zip(segments[1:], speakers[1:])):
         override = pause_overrides[i] if pause_overrides else None
         if override is not None:
             gap = AudioSegment.silent(duration=override)
@@ -113,6 +275,22 @@ class TTSEngine:
         # Language setting (passed to Qwen3-TTS)
         self._language = tts_config.get("language", "English")
 
+        # Cross-segment consistency: reuse one seed per speaker so repeated takes
+        # of the same voice do not drift, and smooth the splice points.
+        self._deterministic_seed = tts_config.get("deterministic_seed", True) is not False
+        self._join_config = resolve_join_config(tts_config.get("join"))
+
+        # How much of the per-line emotion direction is forwarded to the engine.
+        # A long, differently-worded instruct per line is the strongest driver of
+        # timbre drift, so shorter/constant styles trade expressiveness for a
+        # voice that stays recognizably the same person.
+        #   "full"         - per-line instruct as written
+        #   "first_clause" - only the first clause of it (recommended)
+        #   "voice_style"  - ignore it, use character_style only
+        self._instruct_style = str(tts_config.get("instruct_style", "full")).strip().lower()
+        if self._instruct_style not in ("full", "first_clause", "voice_style"):
+            self._instruct_style = "full"
+
         # Sub-batching config
         self._sub_batch_enabled = tts_config.get("sub_batch_enabled", True)
         self._sub_batch_min_size = max(1, tts_config.get("sub_batch_min_size", 4))
@@ -137,6 +315,72 @@ class TTSEngine:
     @property
     def mode(self):
         return self._mode
+
+    @property
+    def join_config(self):
+        """Join-smoothing settings (trim / level match / fade) for this engine."""
+        return dict(self._join_config)
+
+    def _resolve_seed(self, voice_data, speaker, batch_seed=None):
+        """Pick the random seed for one generation request.
+
+        Precedence: explicit per-voice seed > session batch seed > a stable
+        per-speaker seed (default) > -1 (fully random).
+
+        Without this, every chunk of the same speaker was sampled from a fresh
+        random seed, which is a major cause of one voice sounding like a
+        different person from one chunk to the next.
+        """
+        try:
+            explicit = int(str(voice_data.get("seed", -1)).strip() or -1)
+        except (TypeError, ValueError):
+            explicit = -1
+        if explicit >= 0:
+            return explicit
+        if batch_seed is not None:
+            try:
+                session_seed = int(batch_seed)
+            except (TypeError, ValueError):
+                session_seed = -1
+            if session_seed >= 0:
+                return session_seed
+        if self._deterministic_seed:
+            return stable_seed_for_speaker(speaker)
+        return -1
+
+    @staticmethod
+    def _style_with_anchor(instruct_text, voice_data):
+        """Append the speaker's character style to a per-line instruct.
+
+        ``character_style`` is the constant part of the voice identity (timbre,
+        age, accent). Repeating it in *every* request anchors the identity while
+        the per-line instruct only carries the emotion — this is what the local
+        batch path already did; the external path silently dropped it.
+        """
+        instruct = (instruct_text or "").strip()
+        parts = [instruct, (
+            (voice_data.get("character_style") or voice_data.get("default_style") or "").strip()
+        )]
+        out = ""
+        for part in parts:
+            if part and part not in out:
+                out = f"{out} {part}".strip()
+        return out
+
+    def _build_instruct(self, instruct_text, voice_data, fallback=""):
+        """Build the instruct string sent for one request.
+
+        Applies the configured ``tts.instruct_style`` policy on top of the
+        per-line direction, then anchors the speaker's constant character style.
+        """
+        line = (instruct_text or "").strip()
+        if self._instruct_style == "voice_style":
+            line = ""
+        elif self._instruct_style == "first_clause" and line:
+            # "Respectful but urgent, professional yet anxious." -> "Respectful but urgent"
+            line = re.split(r"[,，;；]", line, maxsplit=1)[0].strip()
+        instruct = self._style_with_anchor(line, voice_data)
+        return instruct or (fallback or "").strip()
 
     @property
     def downloads_enabled(self):
@@ -807,21 +1051,27 @@ class TTSEngine:
 
     # ── Core generation methods ──────────────────────────────────
 
-    def generate_custom_voice(self, text, instruct_text, speaker, voice_config, output_path):
+    def generate_custom_voice(self, text, instruct_text, speaker, voice_config, output_path,
+                              batch_seed=None):
         """Generate audio using CustomVoice model. Returns True on success."""
         if self._mode == "local":
-            return self._local_generate_custom(text, instruct_text, speaker, voice_config, output_path)
+            return self._local_generate_custom(text, instruct_text, speaker, voice_config,
+                                               output_path, batch_seed=batch_seed)
         else:
-            return self._external_generate_custom(text, instruct_text, speaker, voice_config, output_path)
+            return self._external_generate_custom(text, instruct_text, speaker, voice_config,
+                                                  output_path, batch_seed=batch_seed)
 
-    def generate_clone_voice(self, text, speaker, voice_config, output_path):
+    def generate_clone_voice(self, text, speaker, voice_config, output_path, batch_seed=None):
         """Generate audio using voice cloning. Returns True on success."""
         if self._mode == "local":
-            return self._local_generate_clone(text, speaker, voice_config, output_path)
+            return self._local_generate_clone(text, speaker, voice_config, output_path,
+                                              batch_seed=batch_seed)
         else:
-            return self._external_generate_clone(text, speaker, voice_config, output_path)
+            return self._external_generate_clone(text, speaker, voice_config, output_path,
+                                                 batch_seed=batch_seed)
 
-    def generate_voice(self, text, instruct_text, speaker, voice_config, output_path):
+    def generate_voice(self, text, instruct_text, speaker, voice_config, output_path,
+                       batch_seed=None):
         """Generate audio using the appropriate method based on voice type config."""
         voice_data = voice_config.get(speaker)
         if not voice_data:
@@ -831,13 +1081,15 @@ class TTSEngine:
         voice_type = voice_data.get("type", "custom")
 
         if voice_type == "clone":
-            return self.generate_clone_voice(text, speaker, voice_config, output_path)
+            return self.generate_clone_voice(text, speaker, voice_config, output_path,
+                                             batch_seed=batch_seed)
         elif voice_type in ("lora", "builtin_lora"):
             return self.generate_lora_voice(text, instruct_text, voice_data, output_path)
         elif voice_type == "design":
             return self.generate_design_voice(text, instruct_text, voice_data, output_path)
         else:
-            return self.generate_custom_voice(text, instruct_text, speaker, voice_config, output_path)
+            return self.generate_custom_voice(text, instruct_text, speaker, voice_config, output_path,
+                                              batch_seed=batch_seed)
 
     # ── Voice design generation ──────────────────────────────────
 
@@ -927,7 +1179,7 @@ class TTSEngine:
 
     # ── LoRA voice generation ────────────────────────────────────
 
-    def generate_lora_voice(self, text, instruct_text, voice_data, output_path):
+    def generate_lora_voice(self, text, instruct_text, voice_data, output_path, batch_seed=None):
         """Generate audio using a LoRA-finetuned Base model.
 
         The adapter directory must contain:
@@ -938,7 +1190,8 @@ class TTSEngine:
         The LoRA weights refine voice identity beyond what the reference alone provides.
         """
         if self._mode != "local":
-            return self._external_generate_adapter_voice(text, voice_data, output_path)
+            return self._external_generate_adapter_voice(text, voice_data, output_path,
+                                                         batch_seed=batch_seed)
 
         try:
             import torch
@@ -999,6 +1252,11 @@ class TTSEngine:
 
             model = self._init_local_lora(adapter_path)
 
+            # Reuse one seed per adapter so repeated takes keep the same identity
+            seed = self._resolve_seed(voice_data, os.path.basename(adapter_path), batch_seed)
+            if seed >= 0:
+                torch.manual_seed(seed)
+
             # Build or reuse voice clone prompt for this adapter
             if adapter_path not in self._lora_prompt_cache:
                 audio_array, sample_rate = sf.read(ref_wav_path)
@@ -1017,10 +1275,7 @@ class TTSEngine:
 
             # Build instruct_ids so the Base model can follow style prompts
             gen_extra = {}
-            instruct = instruct_text or ""
-            character_style = voice_data.get("character_style", "") or voice_data.get("default_style", "")
-            if character_style:
-                instruct = f"{instruct} {character_style}".strip()
+            instruct = self._build_instruct(instruct_text, voice_data)
             if instruct:
                 instruct_formatted = f"<|im_start|>user\n{instruct}<|im_end|>\n"
                 gen_extra["instruct_ids"] = model._tokenize_texts([instruct_formatted])
@@ -1120,7 +1375,8 @@ class TTSEngine:
                     output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
                     try:
                         success = self.generate_clone_voice(
-                            chunk["text"], chunk["speaker"], voice_config, output_path
+                            chunk["text"], chunk["speaker"], voice_config, output_path,
+                            batch_seed=batch_seed,
                         )
                         if success:
                             batch_results["completed"].append(idx)
@@ -1149,6 +1405,7 @@ class TTSEngine:
                             instruct_text=chunk.get("instruct", ""),
                             voice_data=voice_data,
                             output_path=output_path,
+                            batch_seed=batch_seed,
                         )
                         if success:
                             batch_results["completed"].append(idx)
@@ -1187,7 +1444,8 @@ class TTSEngine:
 
     # ── Local backend methods ────────────────────────────────────
 
-    def _local_generate_custom(self, text, instruct_text, speaker, voice_config, output_path):
+    def _local_generate_custom(self, text, instruct_text, speaker, voice_config, output_path,
+                               batch_seed=None):
         """Generate custom voice audio using local Qwen3-TTS model."""
         try:
             import torch
@@ -1199,13 +1457,14 @@ class TTSEngine:
 
             voice = voice_data.get("voice", "Ryan")
             default_style = voice_data.get("default_style", "")
-            seed = int(voice_data.get("seed", -1))
+            seed = self._resolve_seed(voice_data, speaker, batch_seed)
 
-            instruct = instruct_text if instruct_text else (default_style if default_style else "neutral")
+            instruct = self._build_instruct(instruct_text, voice_data,
+                                            fallback=default_style or "neutral")
 
             import time
 
-            print(f"TTS [local] generating with instruct='{instruct}' for text='{text[:50]}...'")
+            print(f"TTS [local] generating (seed={seed}) with instruct='{instruct}' for text='{text[:50]}...'")
 
             model = self._init_local_custom()
 
@@ -1241,7 +1500,7 @@ class TTSEngine:
             traceback.print_exc()
             return False
 
-    def _local_generate_clone(self, text, speaker, voice_config, output_path):
+    def _local_generate_clone(self, text, speaker, voice_config, output_path, batch_seed=None):
         """Generate voice-cloned audio using local Qwen3-TTS Base model."""
         try:
             import torch
@@ -1251,11 +1510,11 @@ class TTSEngine:
                 print(f"Warning: No voice configuration for '{speaker}'. Skipping.")
                 return False
 
-            seed = int(voice_data.get("seed", -1))
+            seed = self._resolve_seed(voice_data, speaker, batch_seed)
 
             import time
 
-            print(f"TTS [local clone] generating for speaker='{speaker}', text='{text[:50]}...'")
+            print(f"TTS [local clone] generating (seed={seed}) for speaker='{speaker}', text='{text[:50]}...'")
 
             prompt = self._get_clone_prompt(speaker, voice_config)
             model = self._init_local_clone()
@@ -1316,11 +1575,8 @@ class TTSEngine:
 
             voice_data = voice_config.get(speaker_name, {})
             voice = voice_data.get("voice", "Ryan")
-            character_style = voice_data.get("character_style", "") or voice_data.get("default_style", "")
 
-            instruct = instruct_text if instruct_text else "neutral"
-            if character_style:
-                instruct = f"{instruct} {character_style}"
+            instruct = self._build_instruct(instruct_text, voice_data, fallback="neutral")
 
             texts.append(text)
             speakers.append(voice)
@@ -1490,6 +1746,10 @@ class TTSEngine:
             print(f"Batch [clone] speaker='{speaker}': {len(texts)} chunks "
                   f"in {len(sub_batches)} sub-batch(es)")
 
+            # One seed per speaker keeps the identity stable across sub-batches.
+            if self._deterministic_seed:
+                torch.manual_seed(stable_seed_for_speaker(speaker))
+
             for sb_idx, (start, end) in enumerate(sub_batches):
                 sb_texts = texts[start:end]
                 sb_indices = indices[start:end]
@@ -1597,6 +1857,10 @@ class TTSEngine:
                     results["failed"].append((chunk["index"], f"Adapter not found: {adapter_path}"))
                 continue
 
+            # One seed per adapter keeps the identity stable across sub-batches.
+            if self._deterministic_seed:
+                torch.manual_seed(stable_seed_for_speaker(os.path.basename(adapter_path)))
+
             # Load adapter and build/get clone prompt
             try:
                 ref_wav_path = os.path.join(adapter_path, "ref_sample.wav")
@@ -1632,8 +1896,6 @@ class TTSEngine:
                     results["failed"].append((chunk["index"], str(e)))
                 continue
 
-            character_style = voice_data.get("character_style", "") or voice_data.get("default_style", "")
-
             texts = [c["text"] for c in group]
             instructs_raw = [c.get("instruct", "") for c in group]
             indices = [c["index"] for c in group]
@@ -1667,9 +1929,7 @@ class TTSEngine:
                     # Build instruct_ids list for this sub-batch
                     instruct_ids = []
                     for inst in sb_instructs:
-                        instruct = inst or ""
-                        if character_style:
-                            instruct = f"{instruct} {character_style}".strip()
+                        instruct = self._build_instruct(inst, voice_data)
                         if instruct:
                             instruct_formatted = f"<|im_start|>user\n{instruct}<|im_end|>\n"
                             instruct_ids.append(model._tokenize_texts([instruct_formatted])[0])
@@ -1757,7 +2017,8 @@ class TTSEngine:
         self._openai_speech(payload, wav_path)
         return wav_path, sf.info(wav_path).samplerate
 
-    def _external_generate_custom(self, text, instruct_text, speaker, voice_config, output_path):
+    def _external_generate_custom(self, text, instruct_text, speaker, voice_config, output_path,
+                                  batch_seed=None):
         """Generate custom voice audio via the external TTS server."""
         try:
             voice_data = voice_config.get(speaker)
@@ -1767,11 +2028,12 @@ class TTSEngine:
 
             voice = voice_data.get("voice", "Ryan")
             default_style = voice_data.get("default_style", "")
-            seed = int(voice_data.get("seed", -1))
+            seed = self._resolve_seed(voice_data, speaker, batch_seed)
 
             if self._external_api != "gradio":
-                instruct = instruct_text if instruct_text else default_style
-                print(f"TTS [external/openai] voice='{voice}' instruct='{instruct}' "
+                # Instruct = per-line emotion + the speaker's constant style anchor.
+                instruct = self._build_instruct(instruct_text, voice_data, fallback=default_style)
+                print(f"TTS [external/openai] voice='{voice}' seed={seed} instruct='{instruct}' "
                       f"text='{text[:50]}...'")
                 payload = {
                     "input": text,
@@ -1785,9 +2047,9 @@ class TTSEngine:
                     payload["seed"] = seed
                 return self._openai_speech(payload, output_path)
 
-            instruct = instruct_text if instruct_text else (default_style if default_style else "neutral")
+            instruct = self._build_instruct(instruct_text, voice_data, fallback=default_style or "neutral")
 
-            print(f"TTS [external] generating with instruct='{instruct}' for text='{text[:50]}...'")
+            print(f"TTS [external] generating (seed={seed}) with instruct='{instruct}' for text='{text[:50]}...'")
 
             client = self._init_external()
 
@@ -1835,7 +2097,7 @@ class TTSEngine:
             payload["seed"] = seed
         return self._openai_speech(payload, output_path)
 
-    def _external_generate_adapter_voice(self, text, voice_data, output_path):
+    def _external_generate_adapter_voice(self, text, voice_data, output_path, batch_seed=None):
         """Approximate a LoRA voice on an external server.
 
         The adapter is a local training artifact the remote server knows nothing
@@ -1869,7 +2131,7 @@ class TTSEngine:
             return False
 
         try:
-            seed = int(voice_data.get("seed", -1))
+            seed = self._resolve_seed(voice_data, voice_data.get("name", "") or adapter_path, batch_seed)
         except (TypeError, ValueError):
             seed = -1
 
@@ -1883,7 +2145,7 @@ class TTSEngine:
             traceback.print_exc()
             return False
 
-    def _external_generate_clone(self, text, speaker, voice_config, output_path):
+    def _external_generate_clone(self, text, speaker, voice_config, output_path, batch_seed=None):
         """Generate voice-cloned audio via the external TTS server.
 
         Requires a Base checkpoint on the server side.
@@ -1896,7 +2158,7 @@ class TTSEngine:
 
             ref_audio = voice_data.get("ref_audio")
             ref_text = voice_data.get("ref_text")
-            seed = int(voice_data.get("seed", -1))
+            seed = self._resolve_seed(voice_data, speaker, batch_seed)
 
             if not ref_audio or not ref_text:
                 print(f"Warning: Clone voice for '{speaker}' missing ref_audio or ref_text. Skipping.")
@@ -1963,6 +2225,7 @@ class TTSEngine:
                     chunk.get("speaker", ""),
                     voice_config,
                     output_path,
+                    batch_seed=batch_seed,
                 )
                 if success:
                     results["completed"].append(idx)
