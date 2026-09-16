@@ -130,6 +130,26 @@ class TTSEngine:
     def mode(self):
         return self._mode
 
+    @property
+    def downloads_enabled(self):
+        """Whether this engine is allowed to download model weights.
+
+        Only local mode needs the Qwen3-TTS checkpoints (~3.5 GB each), so only
+        local mode may pull them. In external mode the engine talks to a remote
+        Gradio server instead and downloads are refused outright; an
+        already-cached snapshot is still reused, it is just never fetched.
+        """
+        return self._mode == "local"
+
+    def _download_blocked_error(self, model_id, reason):
+        """Build the error raised whenever a download is attempted in external mode."""
+        return RuntimeError(
+            f"Refusing to download '{model_id}' ({reason}): TTS mode is "
+            f"'{self._mode}', and models may only be downloaded in 'local' mode. "
+            f"Switch TTS mode to 'local' in the Setup tab, or pre-populate the "
+            f"HuggingFace cache (HF_HOME / ~/.cache/huggingface)."
+        )
+
     @staticmethod
     def _concat_audio(wav):
         """Concatenate audio array(s) into a single numpy array."""
@@ -459,8 +479,7 @@ class TTSEngine:
             return os.path.dirname(result)
         return None
 
-    @staticmethod
-    def _load_model(model_cls, model_id, load_kwargs):
+    def _load_model(self, model_cls, model_id, load_kwargs):
         """Load a model, preferring local cache to avoid network issues.
 
         Checks if the model snapshot exists in the HF cache and loads from
@@ -468,8 +487,12 @@ class TTSEngine:
         Falls back to normal download on first install when cache is empty.
         If loading from local cache fails (e.g. incomplete snapshot), retries
         with the model ID so HF Hub can download any missing files.
+
+        When downloads are disabled (external TTS mode), every path that would
+        reach the HuggingFace Hub raises instead. A complete cached snapshot is
+        still reused — it just is never fetched or topped up.
         """
-        local_path = TTSEngine._resolve_local_model_path(model_id)
+        local_path = self._resolve_local_model_path(model_id)
         if local_path:
             print(f"  Loading from local cache: {local_path}")
             try:
@@ -478,11 +501,20 @@ class TTSEngine:
                 import traceback
                 print(f"  Warning: Failed to load from local cache: {e}")
                 traceback.print_exc()
+                if not self.downloads_enabled:
+                    # The retry below passes the repo id, which lets HF Hub pull
+                    # down whatever is missing from the snapshot.
+                    raise self._download_blocked_error(
+                        model_id, "incomplete local snapshot"
+                    ) from e
                 print(f"  Retrying with model ID (may download missing files)...")
                 return model_cls.from_pretrained(model_id, **load_kwargs)
-        else:
-            print(f"  Model not cached locally, downloading {model_id}...")
-            return model_cls.from_pretrained(model_id, **load_kwargs)
+
+        if not self.downloads_enabled:
+            raise self._download_blocked_error(model_id, "not cached locally")
+
+        print(f"  Model not cached locally, downloading {model_id}...")
+        return model_cls.from_pretrained(model_id, **load_kwargs)
 
     def _init_local_custom(self):
         """Load Qwen3-TTS CustomVoice model on demand."""
@@ -848,11 +880,17 @@ class TTSEngine:
                 # Auto-download built-in adapters from HF
                 adapter_id = os.path.basename(adapter_path)
                 if adapter_id.startswith("builtin_"):
+                    if not self.downloads_enabled:
+                        print(f"Error: '{adapter_id}' is not downloaded, and downloading "
+                              f"is disabled because TTS mode is '{self._mode}'. Download it "
+                              f"from the Training tab while in 'local' mode first.")
+                        return False
                     print(f"Adapter {adapter_id} not downloaded, attempting auto-download...")
                     try:
                         from hf_utils import download_builtin_adapter
                         builtin_dir = os.path.dirname(adapter_path)
-                        download_builtin_adapter(adapter_id, builtin_dir)
+                        download_builtin_adapter(adapter_id, builtin_dir,
+                                                 allow_download=self.downloads_enabled)
                     except Exception as e:
                         print(f"Error: Auto-download failed for {adapter_id}: {e}")
                         return False

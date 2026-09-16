@@ -133,6 +133,16 @@ class ProjectManager:
         except Exception:
             return {}
 
+    def model_downloads_enabled(self):
+        """Whether model weights may be pulled from HuggingFace.
+
+        Only 'local' TTS mode needs the Qwen3-TTS checkpoints, so every endpoint
+        that would fetch a model must consult this first. Defaults to False when
+        the config is missing or names no mode, matching TTSEngine's own
+        "external" default.
+        """
+        return self._load_tts_config().get("mode", "external") == "local"
+
     def load_chunks(self):
         if os.path.exists(self.chunks_path):
             try:

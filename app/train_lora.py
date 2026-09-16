@@ -47,6 +47,9 @@ def parse_args():
                         help="Language for codec prefix token (english, chinese, korean, japanese, etc.)")
     parser.add_argument("--max_audio_seconds", type=float, default=30.0,
                         help="Maximum audio duration in seconds (longer clips are skipped)")
+    parser.add_argument("--no-download", action="store_true",
+                        help="Refuse to download the base model; fail unless it is already "
+                             "in the local HuggingFace cache (external TTS mode)")
     return parser.parse_args()
 
 
@@ -347,6 +350,48 @@ def build_teacher_forcing_input(sample, hf_model, device, dtype, language="engli
 
 # ── Training loop ───────────────────────────────────────────────────────
 
+def resolve_local_snapshot(model_name):
+    """Return the cached HF snapshot directory for model_name, or None if absent."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        cached = try_to_load_from_cache(model_name, "config.json")
+        if isinstance(cached, str):
+            return os.path.dirname(cached)
+    except Exception as e:
+        print(f"[TRAIN] Cache lookup failed for {model_name}: {e}", flush=True)
+    return None
+
+
+def load_base_model(model_name, device, dtype, allow_download=True):
+    """Load the Qwen3-TTS Base model, preferring the local HF cache.
+
+    When allow_download is False (external TTS mode) the model must already be
+    cached — otherwise this raises instead of silently pulling ~3.5 GB.
+    """
+    from qwen_tts import Qwen3TTSModel
+
+    load_kwargs = {
+        "device_map": device if device != "cpu" else None,
+        "dtype": dtype,
+        "attn_implementation": "eager",
+    }
+
+    local_path = resolve_local_snapshot(model_name)
+    if local_path:
+        print(f"[TRAIN] Loading from local cache: {local_path}", flush=True)
+        return Qwen3TTSModel.from_pretrained(local_path, **load_kwargs)
+
+    if not allow_download:
+        raise RuntimeError(
+            f"Refusing to download '{model_name}': it is not in the local HuggingFace "
+            f"cache, and model downloads are disabled in external TTS mode. Switch TTS "
+            f"mode to 'local' in the Setup tab to download it."
+        )
+
+    print(f"[TRAIN] Model not cached locally, downloading {model_name}...", flush=True)
+    return Qwen3TTSModel.from_pretrained(model_name, **load_kwargs)
+
+
 def train(args):
     import torch
     import torch.nn.functional as F
@@ -363,14 +408,9 @@ def train(args):
 
     # ── Load model ──
     print("[TRAIN] Loading Base model...", flush=True)
-    from qwen_tts import Qwen3TTSModel
 
-    model = Qwen3TTSModel.from_pretrained(
-        args.model_name,
-        device_map=device if device != "cpu" else None,
-        dtype=dtype,
-        attn_implementation="eager",
-    )
+    model = load_base_model(args.model_name, device, dtype,
+                            allow_download=not args.no_download)
     processor = model.processor
     hf_model = model.model  # Qwen3TTSForConditionalGeneration
 

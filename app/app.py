@@ -176,6 +176,22 @@ def check_disk_space(path, required_gb):
     except Exception:
         return True, 0
 
+def _require_model_downloads(action):
+    """Reject an action that would download a model while in external TTS mode.
+
+    Only local TTS mode loads Qwen3-TTS checkpoints, so when mode is 'external'
+    the app must never pull weights (~3.5 GB each) or built-in LoRA adapters.
+    """
+    if not project_manager.model_downloads_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Cannot {action}: it requires downloading a model, which is "
+                f"disabled because TTS mode is set to 'external'. Switch TTS mode "
+                f"to 'local' in the Setup tab to download it."
+            ),
+        )
+
 @app.get("/api/system/stats")
 async def get_system_stats():
     """Return GPU and Disk statistics."""
@@ -1785,6 +1801,10 @@ async def lora_start_training(request: LoraTrainingRequest, background_tasks: Ba
         "--gradient_accumulation_steps", str(request.gradient_accumulation_steps),
         "--language", request.language,
     ]
+    if not project_manager.model_downloads_enabled():
+        # External TTS mode: the trainer must reuse the HF cache or fail, never
+        # pull the ~3.5 GB Base checkpoint onto this machine.
+        command.append("--no-download")
 
     def on_training_complete():
         """After training subprocess finishes, update manifest if adapter was saved."""
@@ -1864,6 +1884,8 @@ async def lora_delete_model(adapter_id: str):
 @app.post("/api/lora/download/{adapter_id}")
 async def lora_download_builtin(adapter_id: str):
     """Download a built-in LoRA adapter from HuggingFace."""
+    _require_model_downloads(f"download built-in voice '{adapter_id}'")
+
     manifest = fetch_builtin_manifest(BUILTIN_LORA_DIR)
     hf_name = adapter_id.replace("builtin_", "", 1)
     entry = next((e for e in manifest if e["id"] == hf_name or e["id"] == adapter_id), None)
@@ -1901,6 +1923,7 @@ async def lora_test_model(request: LoraTestRequest):
         audio_url_prefix = f"/lora_models/{request.adapter_id}"
 
     if not os.path.isdir(adapter_dir) and is_builtin:
+        _require_model_downloads(f"generate a test line for '{request.adapter_id}'")
         try:
             download_builtin_adapter(request.adapter_id, BUILTIN_LORA_DIR)
             adapter_dir = os.path.join(BUILTIN_LORA_DIR, request.adapter_id)
@@ -1960,6 +1983,7 @@ async def lora_preview(adapter_id: str):
         url_prefix = f"/lora_models/{adapter_id}"
 
     if not os.path.isdir(adapter_dir) and is_builtin:
+        _require_model_downloads(f"generate a preview for '{adapter_id}'")
         try:
             download_builtin_adapter(adapter_id, BUILTIN_LORA_DIR)
             adapter_dir = os.path.join(BUILTIN_LORA_DIR, adapter_id)

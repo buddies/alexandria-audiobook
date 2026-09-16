@@ -56,25 +56,42 @@ def fetch_builtin_manifest(builtin_dir, hf_repo=BUILTIN_LORA_HF_REPO):
     return entries
 
 
-def download_builtin_adapter(adapter_id, builtin_dir, hf_repo=BUILTIN_LORA_HF_REPO):
+def download_builtin_adapter(adapter_id, builtin_dir, hf_repo=BUILTIN_LORA_HF_REPO,
+                             allow_download=True):
     """Download a built-in LoRA adapter from HF to builtin_dir/adapter_id/.
 
     Args:
         adapter_id: Local adapter ID (e.g. "builtin_watson")
         builtin_dir: Path to the builtin_lora directory
         hf_repo: HF repo ID
+        allow_download: Set False to refuse any network fetch (external TTS
+            mode). Adapters already on disk are still returned untouched.
 
     Returns:
         Path to the adapter directory on disk.
 
     Raises:
-        RuntimeError: If a required file fails to download.
+        RuntimeError: If downloads are disabled, or if a required file fails
+            to download.
     """
     from huggingface_hub import hf_hub_download
 
     # Strip builtin_ prefix to get HF subfolder name
     hf_name = adapter_id.replace("builtin_", "", 1)
     adapter_dir = os.path.join(builtin_dir, adapter_id)
+
+    if not allow_download:
+        # External TTS mode: never touch the Hub. An adapter that is already
+        # complete on disk is returned as-is; otherwise the caller gets a hard
+        # failure instead of a silent download.
+        if not is_adapter_downloaded(adapter_id, builtin_dir):
+            raise RuntimeError(
+                f"Refusing to download built-in adapter '{adapter_id}': model "
+                f"downloads are disabled because TTS mode is set to 'external'. "
+                f"Switch TTS mode to 'local' to download it."
+            )
+        return adapter_dir
+
     os.makedirs(adapter_dir, exist_ok=True)
 
     for filename in REQUIRED_ADAPTER_FILES + OPTIONAL_ADAPTER_FILES:
