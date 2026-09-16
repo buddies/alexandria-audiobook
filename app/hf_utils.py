@@ -43,12 +43,21 @@ def fetch_builtin_manifest(builtin_dir, hf_repo=BUILTIN_LORA_HF_REPO):
         with open(local_path, "w", encoding="utf-8") as f:
             json.dump(entries, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        logger.warning(f"Failed to fetch remote LoRA manifest, using local fallback: {e}")
+        # Offline (or HuggingFace unreachable) is an expected state: the repo ships
+        # its own builtin_lora/manifest.json, so the built-in voice list still works.
+        # Logging that as a WARNING made a perfectly healthy offline run look broken.
         local_path = os.path.join(builtin_dir, "manifest.json")
         if os.path.exists(local_path):
+            logger.info(
+                f"Using the local built-in LoRA manifest (remote fetch skipped: {e})"
+            )
             with open(local_path, "r", encoding="utf-8") as f:
                 entries = json.load(f)
         else:
+            logger.warning(
+                f"No built-in LoRA manifest available: remote fetch failed ({e}) "
+                f"and no local copy at {local_path}. Built-in voices will be empty."
+            )
             entries = []
 
     _manifest_cache = entries
