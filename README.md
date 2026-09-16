@@ -28,7 +28,7 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 
 ### Voice Generation
 - **Built-in TTS Engine** - Qwen3-TTS runs locally with no external server required
-- **External Server Mode** - Optionally connect to a remote Qwen3-TTS Gradio server
+- **External Server Mode** - Optionally offload TTS to a remote server over the OpenAI-compatible `/v1/audio/speech` API (works with vLLM-Omni); a legacy Gradio client path is also available
 - **Multi-Language Support** - English, Chinese, French, German, Italian, Japanese, Korean, Portuguese, Russian, Spanish, or Auto-detect
 - **Custom Voices** - 9 pre-trained voices with instruct-based emotion/tone control
 - **Voice Cloning** - Clone any voice from a 5-15 second reference audio sample
@@ -227,7 +227,9 @@ These tabs are for power users who want more control over voice creation:
 Configure connections to your LLM and TTS engine.
 
 **TTS Settings:**
-- **Mode** - `local` (built-in engine) or `external` (connect to Gradio server)
+- **Mode** - `local` (built-in engine) or `external` (connect to a remote TTS server)
+- **Server URL** - Base URL of the external server, e.g. `http://localhost:8767` (external mode only)
+- **Protocol** - `openai` (default) posts to `<Server URL>/v1/audio/speech`; `gradio` uses the legacy `gradio_client` path
 - **Device** - `auto` (recommended), `cuda`, `cpu`, or `mps`
 - **Language** - TTS synthesis language: English (default), Chinese, French, German, Italian, Japanese, Korean, Portuguese, Russian, Spanish, or Auto (let the model detect)
 - **Parallel Workers** - Batch size for fast batch rendering (higher = more VRAM usage)
@@ -238,6 +240,23 @@ Configure connections to your LLM and TTS engine.
 - **Length Ratio** - Maximum longest/shortest text length ratio before forcing a sub-batch split (default: 5)
 - **Speaker Change Pause** - Silence in milliseconds between different speakers during merge (default: 500)
 - **Same Speaker Pause** - Silence in milliseconds when the same speaker continues during merge (default: 250)
+
+**External TTS Server (`external` mode):**
+
+The default `openai` protocol talks to any OpenAI-compatible speech server. With [vLLM-Omni](https://github.com/vllm-project/vllm-omni), each Qwen3-TTS variant is served on its own port:
+
+```bash
+# Custom Voices (Aiden, Ryan, Vivian, ...) with optional style instructions
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8767
+
+# Voice cloning (speakers with type: "clone")
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni --port 8768
+
+# Voice Designer and persona previews
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign --omni --port 8769
+```
+
+The deploy config (`vllm_omni/deploy/qwen3_tts.yaml`) is auto-loaded from the checkpoint's `model_type`, so `--deploy-config` is only needed to override it. Point **Server URL** at the port matching the voice type you are generating: a CustomVoice server rejects clone requests and vice versa. Reference audio is sent base64-encoded, so the server never needs access to your local files. LoRA voices fall back to cloning the adapter's `ref_sample.wav` in this mode, because the fine-tuned weights exist only on the machine that trained them.
 
 **Prompt Settings (Advanced):**
 - **Generation Settings** - Chunk size and max tokens for LLM responses
@@ -853,7 +872,7 @@ For script generation, non-thinking models work best:
 ### TTS generation fails
 - Check the Pinokio terminal for model loading errors
 - Ensure sufficient VRAM (16+ GB recommended for bfloat16)
-- For external mode, ensure the Gradio TTS server is running at the configured URL
+- For external mode, ensure the TTS server is running and that **Server URL** + **Protocol** match it; a Gradio client pointed at a non-Gradio server fails with `Could not fetch config for ...`, and HTTP 404 errors on `/v1/audio/speech` mean the base URL is wrong
 - Check voice_config.json has valid settings for all speakers
 - For clone voices, verify reference audio exists and transcript is accurate
 

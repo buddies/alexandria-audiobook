@@ -102,6 +102,14 @@ class TTSEngine:
         self._device = tts_config.get("device", "auto")
         self._compile_codec_enabled = tts_config.get("compile_codec", False)
 
+        # External backend protocol:
+        #   "openai" - OpenAI-compatible POST /v1/audio/speech (vLLM-Omni, etc.)
+        #   "gradio" - legacy gradio_client path
+        self._external_api = str(tts_config.get("api", "openai")).lower()
+        self._speech_url = self._build_speech_url(self._url)
+        self._http_timeout = float(tts_config.get("http_timeout", 900))
+        self._http_session = None
+
         # Language setting (passed to Qwen3-TTS)
         self._language = tts_config.get("language", "English")
 
@@ -159,10 +167,17 @@ class TTSEngine:
 
     @staticmethod
     def _clear_gpu_cache():
-        """Free GPU memory: garbage-collect Python objects, then clear CUDA cache."""
+        """Free GPU memory: garbage-collect Python objects, then clear CUDA cache.
+
+        Tolerates a missing torch so the external-mode batch paths can call this
+        unconditionally without requiring a local GPU stack.
+        """
         import gc
         gc.collect()
-        import torch
+        try:
+            import torch
+        except ImportError:
+            return
         torch.cuda.empty_cache()
 
     @staticmethod
@@ -681,17 +696,73 @@ class TTSEngine:
                 self._clear_gpu_cache()
             return unloaded
 
+    @staticmethod
+    def _build_speech_url(url):
+        """Resolve the OpenAI-compatible speech endpoint from a base URL.
+
+        Accepts http://host:port, http://host:port/v1, or
+        http://host:port/v1/audio/speech.
+        """
+        base = (url or "").strip().rstrip("/")
+        if base.endswith("/audio/speech"):
+            return base
+        if not base.endswith("/v1"):
+            base = f"{base}/v1"
+        return f"{base}/audio/speech"
+
+    @staticmethod
+    def _audio_data_url(path):
+        """Encode a local audio file as a base64 data URL.
+
+        The reference clip lives on the client machine, so it has to travel
+        inside the request body - a bare filesystem path is only meaningful when
+        the TTS server runs on the same host.
+        """
+        import base64
+        import mimetypes
+
+        mime = mimetypes.guess_type(path)[0] or "audio/wav"
+        with open(path, "rb") as f:
+            payload = base64.b64encode(f.read()).decode("ascii")
+        return f"data:{mime};base64,{payload}"
+
     def _init_external(self):
-        """Create Gradio client on demand."""
-        if self._gradio_client is not None:
+        """Create the external backend on demand.
+
+        Returns an HTTP session for the OpenAI-compatible protocol, or a
+        gradio_client.Client for the legacy protocol.
+        """
+        if self._external_api == "gradio":
+            if self._gradio_client is not None:
+                return self._gradio_client
+
+            from gradio_client import Client
+
+            print(f"Connecting to Gradio TTS server at {self._url}...")
+            self._gradio_client = Client(self._url)
+            print("Connected to external TTS server.")
             return self._gradio_client
 
-        from gradio_client import Client
+        if self._http_session is None:
+            import requests
 
-        print(f"Connecting to TTS server at {self._url}...")
-        self._gradio_client = Client(self._url)
-        print("Connected to external TTS server.")
-        return self._gradio_client
+            print(f"Using OpenAI-compatible TTS server at {self._speech_url}")
+            self._http_session = requests.Session()
+
+        return self._http_session
+
+    def _openai_speech(self, payload, output_path):
+        """POST an OpenAI-compatible speech request and write the audio response."""
+        client = self._init_external()
+        resp = client.post(self._speech_url, json=payload, timeout=self._http_timeout)
+        if resp.status_code != 200:
+            detail = resp.text[:500].replace("\n", " ")
+            raise RuntimeError(f"TTS server returned HTTP {resp.status_code}: {detail}")
+        if not resp.content:
+            raise RuntimeError("TTS server returned an empty audio response")
+        with open(output_path, "wb") as f:
+            f.write(resp.content)
+        return True
 
     # ── Clone prompt cache (local mode) ──────────────────────────
 
@@ -787,11 +858,15 @@ class TTSEngine:
         """
         import time
         import tempfile
-        import torch
 
         lang = language or self._language
         print(f"VoiceDesign: generating preview for description='{description[:80]}...'"
               f"{f', seed={seed}' if seed >= 0 else ''}")
+
+        if self._mode != "local":
+            return self._external_voice_design(description, sample_text, lang, seed)
+
+        import torch
 
         model = self._init_local_design()
 
@@ -862,6 +937,9 @@ class TTSEngine:
 
         The LoRA weights refine voice identity beyond what the reference alone provides.
         """
+        if self._mode != "local":
+            return self._external_generate_adapter_voice(text, voice_data, output_path)
+
         try:
             import torch
             import time
@@ -1651,8 +1729,36 @@ class TTSEngine:
 
     # ── External backend methods ─────────────────────────────────
 
+    def _external_voice_design(self, description, sample_text, language, seed=-1):
+        """Generate a design-voice preview via an OpenAI-compatible TTS server.
+
+        Requires a VoiceDesign checkpoint on the server side; a CustomVoice or
+        Base server will reject the request.
+        """
+        import time
+
+        print(f"VoiceDesign [external/openai] description='{description[:80]}...'")
+
+        previews_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                    "designed_voices", "previews")
+        os.makedirs(previews_dir, exist_ok=True)
+        wav_path = os.path.join(previews_dir, f"preview_{int(time.time() * 1000)}.wav")
+
+        payload = {
+            "input": sample_text,
+            "instructions": description,
+            "language": language,
+            "response_format": "wav",
+            "task_type": "VoiceDesign",
+        }
+        if seed >= 0:
+            payload["seed"] = seed
+
+        self._openai_speech(payload, wav_path)
+        return wav_path, sf.info(wav_path).samplerate
+
     def _external_generate_custom(self, text, instruct_text, speaker, voice_config, output_path):
-        """Generate custom voice audio via external Gradio server."""
+        """Generate custom voice audio via the external TTS server."""
         try:
             voice_data = voice_config.get(speaker)
             if not voice_data:
@@ -1662,6 +1768,22 @@ class TTSEngine:
             voice = voice_data.get("voice", "Ryan")
             default_style = voice_data.get("default_style", "")
             seed = int(voice_data.get("seed", -1))
+
+            if self._external_api != "gradio":
+                instruct = instruct_text if instruct_text else default_style
+                print(f"TTS [external/openai] voice='{voice}' instruct='{instruct}' "
+                      f"text='{text[:50]}...'")
+                payload = {
+                    "input": text,
+                    "voice": voice,
+                    "language": self._language,
+                    "response_format": "wav",
+                }
+                if instruct:
+                    payload["instructions"] = instruct
+                if seed >= 0:
+                    payload["seed"] = seed
+                return self._openai_speech(payload, output_path)
 
             instruct = instruct_text if instruct_text else (default_style if default_style else "neutral")
 
@@ -1697,11 +1819,76 @@ class TTSEngine:
             traceback.print_exc()
             return False
 
-    def _external_generate_clone(self, text, speaker, voice_config, output_path):
-        """Generate voice-cloned audio via external Gradio server."""
-        try:
-            from gradio_client import handle_file
+    def _external_clone_request(self, text, ref_audio_path, ref_text, seed, output_path):
+        """Send a voice-cloning request to an OpenAI-compatible TTS server."""
+        print(f"TTS [external/openai] clone ref='{os.path.basename(ref_audio_path)}' "
+              f"text='{text[:50]}...'")
+        payload = {
+            "input": text,
+            "ref_audio": self._audio_data_url(ref_audio_path),
+            "ref_text": ref_text,
+            "language": self._language,
+            "response_format": "wav",
+            "task_type": "Base",
+        }
+        if seed >= 0:
+            payload["seed"] = seed
+        return self._openai_speech(payload, output_path)
 
+    def _external_generate_adapter_voice(self, text, voice_data, output_path):
+        """Approximate a LoRA voice on an external server.
+
+        The adapter is a local training artifact the remote server knows nothing
+        about, so fall back to cloning the adapter's own reference sample.
+        """
+        adapter_path = voice_data.get("adapter_path")
+        if not adapter_path:
+            print("Error: No adapter_path in voice_data")
+            return False
+
+        if not os.path.isabs(adapter_path):
+            root_dir = os.path.dirname(os.path.dirname(__file__))
+            adapter_path = os.path.join(root_dir, adapter_path)
+
+        ref_wav_path = os.path.join(adapter_path, "ref_sample.wav")
+        meta_path = os.path.join(adapter_path, "training_meta.json")
+        if not os.path.exists(ref_wav_path) or not os.path.exists(meta_path):
+            print(f"Error: LoRA adapter assets not found in {adapter_path} "
+                  f"(need ref_sample.wav and training_meta.json)")
+            return False
+
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                ref_text = json.load(f).get("ref_sample_text", "")
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Error: Could not read training_meta.json: {e}")
+            return False
+
+        if not ref_text:
+            print("Error: ref_sample_text missing from training_meta.json")
+            return False
+
+        try:
+            seed = int(voice_data.get("seed", -1))
+        except (TypeError, ValueError):
+            seed = -1
+
+        print(f"TTS [external/openai] LoRA voice '{os.path.basename(adapter_path)}' "
+              f"-> falling back to reference-sample cloning")
+        try:
+            return self._external_clone_request(text, ref_wav_path, ref_text, seed, output_path)
+        except Exception as e:
+            import traceback
+            print(f"Error generating LoRA voice externally: {e}")
+            traceback.print_exc()
+            return False
+
+    def _external_generate_clone(self, text, speaker, voice_config, output_path):
+        """Generate voice-cloned audio via the external TTS server.
+
+        Requires a Base checkpoint on the server side.
+        """
+        try:
             voice_data = voice_config.get(speaker)
             if not voice_data:
                 print(f"Warning: No voice configuration for '{speaker}'. Skipping.")
@@ -1723,6 +1910,11 @@ class TTSEngine:
             if not os.path.exists(ref_audio):
                 print(f"Warning: Reference audio not found for '{speaker}': {ref_audio}")
                 return False
+
+            if self._external_api != "gradio":
+                return self._external_clone_request(text, ref_audio, ref_text, seed, output_path)
+
+            from gradio_client import handle_file
 
             client = self._init_external()
 

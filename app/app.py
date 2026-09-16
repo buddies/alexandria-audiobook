@@ -215,7 +215,9 @@ class LLMConfig(BaseModel):
 
 class TTSConfig(BaseModel):
     mode: str = "local"  # "local" or "external"
-    url: str = "http://127.0.0.1:7860"  # external mode only
+    url: str = "http://127.0.0.1:7860"  # external mode only (base URL of the TTS server)
+    api: str = "openai"  # external mode protocol: "openai" (/v1/audio/speech) or "gradio"
+    http_timeout: float = 900  # external mode: per-request timeout in seconds
     device: str = "auto"  # local mode: "auto", "cuda:0", "cpu", etc.
     language: str = "English"  # TTS language
     parallel_workers: int = 2  # concurrent TTS workers
@@ -492,6 +494,7 @@ async def get_config():
         "tts": {
             "mode": "local",
             "url": "http://127.0.0.1:7860",
+            "api": "openai",
             "device": "auto"
         },
         "prompts": {

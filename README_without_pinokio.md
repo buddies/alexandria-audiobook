@@ -34,6 +34,7 @@
   - [7. 环境变量](#7-环境变量)
   - [8. 首次运行会发生什么](#8-首次运行会发生什么)
   - [9. 模型下载策略（external 模式）](#9-模型下载策略external-模式)
+    - [9.1 启动远程 TTS 服务器（vLLM-Omni）](#91-启动远程-tts-服务器vllm-omni)
   - [10. 更新与重置](#10-更新与重置)
     - [10.1 更新（等价于 `update.js`）](#101-更新等价于-updatejs)
     - [10.2 重置（等价于 `reset.js`）](#102-重置等价于-resetjs)
@@ -256,12 +257,12 @@ pip install qwen-tts==0.1.1
 >
 > `peft==0.18.1`（在 `app/requirements.txt` 里）硬依赖 `torch>=1.13.0`，`qwen-tts` 依赖 `torchaudio` —— 所以 `pip install -r app/requirements.txt` 会**自动**装上 PyPI 的默认轮子。macOS 上这就是正确的版本，无需挑索引、无需 `--force-reinstall`。
 >
-> 而且**不能卸载它**：`app/tts.py` 的 `_clear_gpu_cache()` 里有一处**无保护**的 `import torch`（在 `try` 之外），而 `external` 模式的批处理每处理完一组音色都会调用它 —— 删掉 torch 会让批次直接崩。
+> `app/tts.py` 的 `_clear_gpu_cache()` 已改为容忍 `torch` 缺失（`except ImportError`），所以 `external` 模式的批处理不会再因为没装 torch 而崩。
 >
 > | 在 `external` 模式下…… | 状态 |
 > |---|---|
 > | 剧本生成 / 审阅（`generate_script.py`，只用 `openai`） | ✅ 不碰 torch |
-> | Custom Voice / Clone Voice 生成（远端 Gradio） | ✅ 不碰 torch |
+> | Custom Voice / Clone Voice 生成（远端 HTTP） | ✅ 不碰 torch |
 > | GPU 状态面板（`get_gpu_stats`） | ✅ 有 `except ImportError` 保护，显示为空 |
 > | 拼接 / MP3 / M4B / Audacity 导出（`project.py`） | ✅ 只用 pydub + ffmpeg |
 > | 语音设计、Persona 生成、LoRA 训练、内置 LoRA 音色 | ❌ 需要**本地** Qwen3-TTS 模型，无法使用 |
@@ -409,7 +410,7 @@ Alexandria 的 TTS 有两种模式：
 | 模式 | 行为 |
 |---|---|
 | `local` | 内置 Qwen3-TTS，直接加载本地权重（会下载 ~3.5 GB/变体） |
-| `external` | 连接到远程 Qwen3-TTS Gradio 服务器，**禁止下载任何模型** |
+| `external` | 通过 HTTP 连接远程 TTS 服务器（默认 **OpenAI 兼容** `/v1/audio/speech`，如 vLLM-Omni），**禁止下载任何模型** |
 
 **当 TTS 模式设为 `external` 时，本仓库会拒绝一切模型下载**，避免在只做 UI 的机器上意外拉取数 GB 权重：
 
@@ -420,6 +421,30 @@ Alexandria 的 TTS 有两种模式：
 - **已经下载好的缓存权重仍然可以正常复用**，只是不会再发起新的下载。
 
 这条策略让 external 模式成为"零下载"的理想选择：在 macOS 这类只能跑 CPU 的机器上，把 Web UI 留在本地、把 TTS 卸载到远程 GPU 服务器。
+
+### 9.1 启动远程 TTS 服务器（vLLM-Omni）
+
+`external` 模式默认走 **OpenAI 兼容协议**（`POST <Server URL>/v1/audio/speech`），可以直接对接 [vLLM-Omni](https://github.com/vllm-project/vllm-omni)。每个 Qwen3-TTS 变体是一个独立检查点，需要各起一个进程、各占一个端口：
+
+```bash
+# Custom Voice（Aiden / Ryan / Vivian 等预设音色，支持 instruct 风格指令）
+vllm serve /path/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8767
+
+# 语音克隆（voice_config.json 里 type 为 "clone" 的说话人）
+vllm serve /path/Qwen3-TTS-12Hz-1.7B-Base --omni --port 8768
+
+# 语音设计 / Persona 预览
+vllm serve /path/Qwen3-TTS-12Hz-1.7B-VoiceDesign --omni --port 8769
+```
+
+要点：
+
+- `vllm_omni/deploy/qwen3_tts.yaml` 会按检查点的 `model_type` **自动加载**，`--deploy-config` 只在需要覆盖时才传；
+- 部署 YAML 里两个 stage 各占 `gpu_memory_utilization: 0.3`，单卡合计 0.6，显存充裕时可以调高；
+- Web UI 的 **Server URL** 填对应变体的端口，**Protocol** 保持 `openai`（默认）；
+- 参考音频会以 base64 `data:` URL 随请求发送，所以服务器**不需要**能访问你本地的文件；
+- LoRA 音色在 external 模式下会退化为克隆适配器目录里的 `ref_sample.wav`（微调权重只存在于训练它的机器上）；
+- `/config` 返回 404 且报 `Could not fetch config for ...`，说明把 URL 指给了一个非 Gradio 服务 —— 这正是旧版行为，现在默认协议已改为 `openai`。
 
 ---
 

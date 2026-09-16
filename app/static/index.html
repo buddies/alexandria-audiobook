@@ -120,12 +120,20 @@
                                     <option value="external">External Server</option>
                                     <option value="local">Local Model</option>
                                 </select>
-                                <div class="form-text">Local loads model in-process; External connects to a Gradio TTS server</div>
+                                <div class="form-text">Local loads model in-process; External connects to an HTTP TTS server</div>
                             </div>
-                            <div class="col-md-5" id="tts-url-group">
+                            <div class="col-md-4" id="tts-url-group">
                                 <label class="form-label">TTS Server URL</label>
                                 <input type="text" class="form-control" id="tts-url" value="http://127.0.0.1:7860">
-                                <div class="form-text">URL for the Qwen3-TTS Gradio server</div>
+                                <div class="form-text">Base URL of the external TTS server</div>
+                            </div>
+                            <div class="col-md-3" id="tts-api-group">
+                                <label class="form-label">TTS Protocol</label>
+                                <select class="form-select" id="tts-api">
+                                    <option value="openai">OpenAI-compatible</option>
+                                    <option value="gradio">Gradio (legacy)</option>
+                                </select>
+                                <div class="form-text">OpenAI-compatible uses POST /v1/audio/speech (vLLM-Omni)</div>
                             </div>
                             <div class="col-md-4" id="tts-device-group" style="display:none;">
                                 <label class="form-label">Device</label>
@@ -1163,6 +1171,7 @@
         function toggleTTSMode() {
             const mode = document.getElementById('tts-mode').value;
             document.getElementById('tts-url-group').style.display = mode === 'external' ? '' : 'none';
+            document.getElementById('tts-api-group').style.display = mode === 'external' ? '' : 'none';
             document.getElementById('tts-device-group').style.display = mode === 'local' ? '' : 'none';
             document.getElementById('tts-local-options').style.display = mode === 'local' ? '' : 'none';
         }
@@ -1178,6 +1187,7 @@
                 document.getElementById('llm-model').value = config.llm.model_name;
                 document.getElementById('tts-mode').value = config.tts.mode || 'external';
                 document.getElementById('tts-url').value = config.tts.url || 'http://127.0.0.1:7860';
+                document.getElementById('tts-api').value = config.tts.api || 'openai';
                 document.getElementById('tts-device').value = config.tts.device || 'auto';
                 document.getElementById('tts-language').value = config.tts.language || 'English';
                 document.getElementById('parallel-workers').value = config.tts.parallel_workers || 2;
@@ -1356,6 +1366,7 @@
                 tts: {
                     mode: document.getElementById('tts-mode').value,
                     url: document.getElementById('tts-url').value,
+                    api: document.getElementById('tts-api').value,
                     device: document.getElementById('tts-device').value,
                     language: document.getElementById('tts-language').value,
                     parallel_workers: parallelWorkers,
