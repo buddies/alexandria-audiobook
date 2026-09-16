@@ -215,7 +215,7 @@ Web UI 显示的是高层状态，**详细日志在 Pinokio 终端中**：
 - 确认 LLM 服务器正在运行且可访问
 - 验证模型名称与已加载模型一致
 - 尝试使用其他模型 — 某些模型在 JSON 输出方面表现不佳
-- 思维链模型（DeepSeek-R1、GLM4 等）可能干扰 JSON 输出。如需使用，请在设置中的 **Banned Tokens** 字段添加 `<think>` 以禁用思考模式
+- 思维链模型（DeepSeek-R1、GLM4、Qwen3 思考模式、gpt-oss 等）可直接使用：思考内容会被自动识别并从正文中分离，无论是独立的 `reasoning_content` 字段、`<think>` 标签、原始分词器特殊 token（如 `<|begin_of_thought|>`），还是 gpt-oss 的 channel 标记。思考会占用 `max_tokens`，因此一旦响应被截断，会自动加倍输出预算重试，而不会交出一份被截断的正文。完全不需要思考时，仍可在 **Banned Tokens** 中填入 `<think>` 来禁用
 
 ### 模型下载失败或速度很慢
 - TTS 模型（每个约 3.5 GB）在首次使用时从 Hugging Face 下载

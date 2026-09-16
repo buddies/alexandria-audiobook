@@ -6,6 +6,12 @@ import argparse
 from openai import OpenAI
 from review_prompts import REVIEW_SYSTEM_PROMPT, REVIEW_USER_PROMPT
 from generate_script import clean_json_string, repair_json_array, salvage_json_entries
+from llm_utils import (
+    analyze_response,
+    next_max_tokens,
+    reasoning_log_section,
+    reasoning_warning,
+)
 
 
 def _is_section_break(text):
@@ -99,7 +105,12 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
     batch_json = json.dumps(batch_entries, indent=2, ensure_ascii=False)
     user_prompt = usr_template.format(context=context, batch=batch_json)
 
+    # Output budget for this batch. Thinking output is charged against it, so a
+    # truncated reply is retried with a bigger budget instead of being accepted.
+    effective_max_tokens = max_tokens
+
     for attempt in range(max_retries + 1):
+        truncated = False
         try:
             response = client.chat.completions.create(
                 model=model_name,
@@ -110,7 +121,7 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                 temperature=temperature,
                 top_p=top_p,
                 presence_penalty=presence_penalty,
-                max_tokens=max_tokens,
+                max_tokens=effective_max_tokens,
                 extra_body={
                     k: v for k, v in {
                         "top_k": top_k,
@@ -120,12 +131,13 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                 }
             )
 
-            choice = response.choices[0]
-            text = choice.message.content.strip()
-            finish_reason = choice.finish_reason
-            usage = getattr(response, 'usage', None)
+            # Split the answer body from any server-side thinking output
+            output = analyze_response(response)
+            text = output.body
+            finish_reason = output.finish_reason
+            usage = output.usage
 
-            # Log raw response
+            # Log raw response (thinking kept, but clearly separated)
             log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
             os.makedirs(log_dir, exist_ok=True)
             log_path = os.path.join(log_dir, "review_responses.log")
@@ -135,19 +147,40 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                 if usage:
                     lf.write(f"tokens: prompt={getattr(usage, 'prompt_tokens', '?')} completion={getattr(usage, 'completion_tokens', '?')}\n")
                 lf.write(f"{'─'*80}\n")
+                lf.write(reasoning_log_section(output))
                 lf.write(text)
                 lf.write(f"\n{'='*80}\n")
 
             print(f"  finish_reason={finish_reason}", end="")
+            if output.has_reasoning:
+                print(f" | thinking={len(output.reasoning)} chars", end="")
             if usage:
                 print(f" | tokens: prompt={getattr(usage, 'prompt_tokens', '?')} completion={getattr(usage, 'completion_tokens', '?')}", end="")
             print()
 
-            if finish_reason == "length":
-                print(f"  WARNING: Response was truncated (hit max_tokens={max_tokens}). Consider increasing max_tokens or reducing batch size.")
+            thinking_issue = reasoning_warning(output)
+            if thinking_issue:
+                print(f"  WARNING: {thinking_issue}")
+
+            truncated = finish_reason == "length"
+            if truncated:
+                if output.has_reasoning:
+                    print(f"  WARNING: Response was truncated (hit max_tokens={effective_max_tokens}) "
+                          f"after {len(output.reasoning)} chars of thinking.")
+                else:
+                    print(f"  WARNING: Response was truncated (hit max_tokens={effective_max_tokens}). "
+                          f"Consider increasing max_tokens or reducing batch size.")
+                if attempt < max_retries:
+                    grown = next_max_tokens(effective_max_tokens, max_tokens)
+                    if grown > effective_max_tokens:
+                        effective_max_tokens = grown
+                        print(f"  Retrying with a larger output budget: max_tokens={effective_max_tokens}")
 
         except Exception as e:
             print(f"Error calling LLM API (attempt {attempt + 1}): {e}")
+            if effective_max_tokens > max_tokens:
+                # Server refused the larger budget (context limit?) — fall back.
+                effective_max_tokens = max_tokens
             if attempt < max_retries:
                 continue
             return None
@@ -163,10 +196,21 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
             print(f"Response preview: {text[:300]}...")
             return None
 
+        # A truncated answer is incomplete by definition, and the repair/salvage
+        # helpers below happily return a partial entry list — the review pass must
+        # return every entry, so a partial result is never acceptable here.
+        if truncated and attempt < max_retries:
+            print("  Not accepting a partial result — retrying for the complete answer...")
+            continue
+
+        if truncated:
+            print(f"  WARNING: all retries exhausted, using a possibly incomplete response for batch {batch_num} "
+                  f"(entries may be missing from the reviewed output).")
+
         entries = repair_json_array(json_text)
 
         if entries and len(entries) > 0:
-            if attempt > 0:
+            if attempt > 0 and not truncated:
                 print(f"  Succeeded on retry {attempt + 1}")
             return entries
 

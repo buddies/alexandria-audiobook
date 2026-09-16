@@ -5,6 +5,13 @@ import re
 import argparse
 from openai import OpenAI
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
+from llm_utils import (
+    analyze_response,
+    next_max_tokens,
+    reasoning_log_section,
+    reasoning_warning,
+    strip_thinking_markup,
+)
 
 # Cap for single-speaker mode: entries at this size pass through
 # group_into_chunks (MAX_CHUNK_CHARS=500) as-is without further splitting.
@@ -12,15 +19,10 @@ SINGLE_SPEAKER_MAX_CHARS = 500
 
 def clean_json_string(text):
     """Clean and extract valid JSON array from LLM response."""
-    # Remove thinking tags (various formats used by different models)
-    # GLM, DeepSeek, Qwen, etc. use different thinking tag formats
-    text = re.sub(r'<think>[\s\S]*?</think>', '', text)
-    text = re.sub(r'<thinking>[\s\S]*?</thinking>', '', text)
-    text = re.sub(r'<reflection>[\s\S]*?</reflection>', '', text)
-    text = re.sub(r'<reasoning>[\s\S]*?</reasoning>', '', text)
-    # Handle unclosed thinking tags (model started thinking but didn't close)
-    text = re.sub(r'<think>[\s\S]*$', '', text)
-    text = re.sub(r'<thinking>[\s\S]*$', '', text)
+    # Remove thinking markup (GLM, DeepSeek, Qwen, gpt-oss, ... all differ);
+    # already handled when reading the response, kept here as a safety net for
+    # callers that pass raw text.
+    text = strip_thinking_markup(text)
 
     # Remove markdown code blocks
     if "```" in text:
@@ -263,7 +265,12 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
     context = "\n".join(context_parts)
     user_prompt = usr_template.format(context=context, chunk=chunk)
 
+    # Output budget for this chunk. Thinking output is charged against it, so a
+    # truncated reply is retried with a bigger budget instead of being accepted.
+    effective_max_tokens = max_tokens
+
     for attempt in range(max_retries + 1):
+        truncated = False
         try:
             response = client.chat.completions.create(
                 model=model_name,
@@ -274,7 +281,7 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
                 temperature=temperature,
                 top_p=top_p,
                 presence_penalty=presence_penalty,
-                max_tokens=max_tokens,
+                max_tokens=effective_max_tokens,
                 extra_body={
                     k: v for k, v in {
                         "top_k": top_k if top_k else None,
@@ -284,12 +291,13 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
                 }
             )
 
-            choice = response.choices[0]
-            text = choice.message.content.strip()
-            finish_reason = choice.finish_reason
-            usage = getattr(response, 'usage', None)
+            # Split the answer body from any server-side thinking output
+            output = analyze_response(response)
+            text = output.body
+            finish_reason = output.finish_reason
+            usage = output.usage
 
-            # Log raw response for debugging
+            # Log raw response for debugging (thinking kept, but clearly separated)
             log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
             os.makedirs(log_dir, exist_ok=True)
             log_path = os.path.join(log_dir, "llm_responses.log")
@@ -299,19 +307,39 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
                 if usage:
                     lf.write(f"tokens: prompt={getattr(usage, 'prompt_tokens', '?')} completion={getattr(usage, 'completion_tokens', '?')}\n")
                 lf.write(f"{'─'*80}\n")
+                lf.write(reasoning_log_section(output))
                 lf.write(text)
                 lf.write(f"\n{'='*80}\n")
 
             print(f"  finish_reason={finish_reason}", end="")
+            if output.has_reasoning:
+                print(f" | thinking={len(output.reasoning)} chars", end="")
             if usage:
                 print(f" | tokens: prompt={getattr(usage, 'prompt_tokens', '?')} completion={getattr(usage, 'completion_tokens', '?')}", end="")
             print()
 
-            if finish_reason == "length":
-                print(f"  WARNING: Response was truncated (hit max_tokens={max_tokens}). Consider increasing max_tokens.")
+            thinking_issue = reasoning_warning(output)
+            if thinking_issue:
+                print(f"  WARNING: {thinking_issue}")
+
+            truncated = finish_reason == "length"
+            if truncated:
+                if output.has_reasoning:
+                    print(f"  WARNING: Response was truncated (hit max_tokens={effective_max_tokens}) "
+                          f"after {len(output.reasoning)} chars of thinking.")
+                else:
+                    print(f"  WARNING: Response was truncated (hit max_tokens={effective_max_tokens}). Consider increasing max_tokens.")
+                if attempt < max_retries:
+                    grown = next_max_tokens(effective_max_tokens, max_tokens)
+                    if grown > effective_max_tokens:
+                        effective_max_tokens = grown
+                        print(f"  Retrying with a larger output budget: max_tokens={effective_max_tokens}")
 
         except Exception as e:
             print(f"Error calling LLM API (attempt {attempt + 1}): {e}")
+            if effective_max_tokens > max_tokens:
+                # Server refused the larger budget (context limit?) — fall back.
+                effective_max_tokens = max_tokens
             if attempt < max_retries:
                 continue
             return []
@@ -327,11 +355,23 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
             print(f"Response preview: {text[:300]}...")
             return []
 
+        # A truncated answer is incomplete by definition, and the repair/salvage
+        # helpers below happily return a partial entry list — which would silently
+        # drop the rest of the chunk. Ask for the complete answer first; only
+        # salvage on the final attempt, when there is nothing left to try.
+        if truncated and attempt < max_retries:
+            print("  Not accepting a partial result — retrying for the complete answer...")
+            continue
+
+        if truncated:
+            print(f"  WARNING: all retries exhausted, using a possibly incomplete response for chunk {chunk_num} "
+                  f"(the tail of this chunk may be missing).")
+
         # Try to parse, with repair attempts
         entries = repair_json_array(json_text)
 
         if entries and len(entries) > 0:
-            if attempt > 0:
+            if attempt > 0 and not truncated:
                 print(f"  Succeeded on retry {attempt + 1}")
             return entries
 

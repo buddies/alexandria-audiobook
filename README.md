@@ -852,7 +852,14 @@ For script generation, non-thinking models work best:
 - **Llama 3.1/3.2** - Good character distinction
 - **Mistral/Mixtral** - Fast and reliable
 
-**Thinking models** (DeepSeek-R1, GLM4-air, etc.) can interfere with JSON output. If you must use one, add `<think>` to the **Banned Tokens** field in Setup to disable thinking mode.
+**Thinking models** (DeepSeek-R1, GLM4, Qwen3 thinking, gpt-oss, ...) work too. Their
+reasoning is detected automatically and kept out of the answer, whether the server returns
+it as a separate `reasoning_content` field, as `<think>` / `<thinking>` tags, as raw
+tokenizer special tokens (`<|begin_of_thought|>`, `<|end_of_thought|>`) or as gpt-oss
+channel markup. Thinking is charged against `max_tokens`, so if a reply gets cut off the
+request is retried with a larger output budget instead of silently returning a truncated
+script. Banning `<think>` in **Banned Tokens** is still the cheapest option when you don't
+need reasoning at all.
 
 ## Troubleshooting
 

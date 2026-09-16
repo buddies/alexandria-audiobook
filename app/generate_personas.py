@@ -11,6 +11,7 @@ from openai import OpenAI
 from tts import TTSEngine, sanitize_filename
 from utils import atomic_json_write as _atomic_json_write
 from persona_prompts import PERSONA_SYSTEM_PROMPT, PERSONA_USER_PROMPT, PERSONA_ADVANCED_PROMPT
+from llm_utils import analyze_response, reasoning_warning
 
 
 def extract_json_object(text):
@@ -218,7 +219,7 @@ def _resolve_aliases_batch(client, model_name, speakers_info, existing_names):
             temperature=0.1,
             max_tokens=max(1500, len(speakers_info) * 80),
         )
-        result = extract_json_object(response.choices[0].message.content.strip())
+        result = extract_json_object(analyze_response(response).body)
         if isinstance(result, dict):
             # Normalize keys and values to match exact input names casing
             resolved = {}
@@ -544,7 +545,12 @@ def run_advanced_persona_generation(script, selected_speakers, samples, voice_co
                 temperature=0.2,
                 max_tokens=4000,
             )
-            raw_content = response.choices[0].message.content.strip()
+            output = analyze_response(response)
+            raw_content = output.body
+            if not raw_content:
+                thinking_issue = reasoning_warning(output)
+                if thinking_issue:
+                    print(f"  WARNING: {thinking_issue}")
             parsed = extract_json_object(raw_content)
             characters = []
             if isinstance(parsed, dict):
@@ -598,7 +604,7 @@ def run_advanced_persona_generation(script, selected_speakers, samples, voice_co
                 temperature=0.25,
                 max_tokens=600,
             )
-            parsed = extract_json_object(response.choices[0].message.content.strip())
+            parsed = extract_json_object(analyze_response(response).body)
             if parsed:
                 description = str(parsed.get("description", "") or "").strip()
                 ref_text = str(parsed.get("ref_text", "") or "").strip()
@@ -840,7 +846,12 @@ def main():
                 max_tokens=400,
             )
 
-            text = response.choices[0].message.content.strip()
+            output = analyze_response(response)
+            text = output.body
+            if not text:
+                thinking_issue = reasoning_warning(output)
+                if thinking_issue:
+                    print(f"  WARNING: {thinking_issue}")
             parsed = extract_json_object(text)
             description = ""
             ref_text = ""
