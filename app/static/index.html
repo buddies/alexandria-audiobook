@@ -171,7 +171,7 @@
                             <div class="col-md-2">
                                 <label class="form-label">Parallel Workers</label>
                                 <input type="number" class="form-control" id="parallel-workers" value="2" min="1">
-                                <div class="form-text">Concurrent TTS requests</div>
+                                <div class="form-text">Concurrent TTS requests. Set to 1 if you need a pinned Seed to reproduce exactly — the server only honours a seed byte-for-byte while requests don't overlap.</div>
                             </div>
                             <div class="col-md-3">
                                 <label class="form-label">Emotion Direction Per Line</label>
@@ -497,6 +497,13 @@
                         </div>
                         <button class="btn btn-outline-danger" id="btn-cancel-personas" onclick="cancelPersonas()" style="display:none;"><i class="fas fa-stop me-1"></i>Cancel</button>
                         <span id="persona-status" class="text-muted small"></span>
+                    </div>
+                    <div class="d-flex align-items-center gap-2 mb-2 flex-wrap">
+                        <div class="input-group input-group-sm" style="max-width: 520px;">
+                            <span class="input-group-text">Preview line</span>
+                            <input type="text" class="form-control" id="voice-preview-text" placeholder="Empty = a default line in the TTS language">
+                        </div>
+                        <span id="voice-preview-status" class="text-muted small"></span>
                     </div>
                     <div id="voices-list"></div>
                 </div>
@@ -1728,7 +1735,11 @@
                     <div class="card-body">
                         <div class="row">
                             <div class="col-md-3">
-                                <h5 class="card-title">${escapeHtml(voice.name)} ${config.alias_of ? `<span class="badge bg-info ms-2" title="Alias of ${escapeHtml(config.alias_of)}">${escapeHtml(config.alias_of)}</span>` : ''}</h5>
+                                <div class="d-flex align-items-center gap-2 flex-wrap">
+                                    <h5 class="card-title m-0">${escapeHtml(voice.name)} ${config.alias_of ? `<span class="badge bg-info ms-2" title="Alias of ${escapeHtml(config.alias_of)}">${escapeHtml(config.alias_of)}</span>` : ''}</h5>
+                                    <button class="btn btn-sm btn-outline-secondary voice-preview-btn" onclick="previewVoice(this)" title="Generate and play a short sample with the current settings"><i class="fas fa-play me-1"></i>Preview</button>
+                                </div>
+                                <div class="voice-preview-audio mt-1"></div>
                                 <div class="form-text small text-muted mt-1">Alias of:</div>
                                 <select class="form-select form-select-sm alias-select mt-1">
                                     <option value="">-- None --</option>
@@ -1774,7 +1785,18 @@
                                             <input type="text" class="form-control character-style" placeholder="Character style (e.g. refined aristocratic tone, heavy Scottish accent)" value="${escapeHtml(config.character_style || config.default_style || '')}">
                                         </div>
                                     </div>
-                                    <div class="form-text">Voice identity anchor. Keep it identical for every line of this speaker (timbre/age/accent) — it is appended to each line's emotion direction so the voice stays the same person across chunks. Write it in the TTS language.</div>
+                                    <div class="row g-2 mt-1 align-items-center">
+                                        <div class="col-md-5">
+                                            <div class="input-group input-group-sm">
+                                                <span class="input-group-text">Seed</span>
+                                                <input type="number" class="form-control voice-seed" min="-1" step="1" placeholder="-1" value="${escapeHtml(normalizeVoiceSeed(config.seed) === '-1' ? '' : normalizeVoiceSeed(config.seed))}">
+                                                <button class="btn btn-outline-secondary voice-seed-roll" type="button" onclick="rollVoiceSeed(this)" title="Roll a new seed"><i class="fas fa-dice"></i></button>
+                                            </div>
+                                        </div>
+                                        <div class="col-md-7">
+                                            <div class="form-text m-0">Pins the voice identity: the same seed always renders the same timbre, so pick one that fits the character and keep it. Empty or -1 uses the default per-speaker seed.</div>
+                                        </div>
+                                    </div>
                                 </div>
 
                                 <!-- Built-in LoRA Options -->
@@ -1869,6 +1891,22 @@
             `;
         }
 
+        // Per-voice seed: "" / "-1" or anything invalid means "not pinned".
+        function normalizeVoiceSeed(raw) {
+            const text = (raw === null || raw === undefined) ? '' : String(raw).trim();
+            if (text === '') return '-1';
+            const value = parseInt(text, 10);
+            return Number.isFinite(value) && value >= 0 ? String(value) : '-1';
+        }
+
+        window.rollVoiceSeed = (btn) => {
+            const input = btn.closest('.input-group')?.querySelector('.voice-seed');
+            if (!input) return;
+            // Keep it inside the signed 32-bit range so backend/model accept it.
+            input.value = String(Math.floor(Math.random() * 2147483647));
+            debouncedSaveVoices();
+        };
+
         window.toggleVoiceType = (radio) => {
             const card = radio.closest('.card-body');
             card.querySelector('.custom-opts').style.display = radio.value === 'custom' ? 'block' : 'none';
@@ -1907,63 +1945,102 @@
             }
         }
 
+        function collectCardConfig(card) {
+            const alias = card.querySelector('.alias-select') ? card.querySelector('.alias-select').value : '';
+            const type = card.querySelector('.voice-type:checked').value;
+            let config;
+
+            if (type === 'custom') {
+                config = {
+                    type: 'custom',
+                    voice: card.querySelector('.voice-select').value,
+                    character_style: card.querySelector('.character-style').value,
+                    seed: normalizeVoiceSeed(card.querySelector('.voice-seed')?.value)
+                };
+            } else if (type === 'clone') {
+                config = {
+                    type: 'clone',
+                    ref_text: card.querySelector('.ref-text').value,
+                    ref_audio: card.querySelector('.ref-audio').value,
+                    seed: "-1"
+                };
+            } else if (type === 'builtin_lora') {
+                const adapterId = card.querySelector('.builtin-lora-select').value;
+                const adapterEntry = (window._loraModelsCache || []).find(m => m.id === adapterId);
+                config = {
+                    type: 'builtin_lora',
+                    adapter_id: adapterId,
+                    adapter_path: adapterEntry?.adapter_path || '',
+                    character_style: card.querySelector('.builtin-lora-style').value,
+                    seed: "-1"
+                };
+            } else if (type === 'lora') {
+                const adapterId = card.querySelector('.lora-adapter-select').value;
+                const adapterEntry = (window._loraModelsCache || []).find(m => m.id === adapterId);
+                config = {
+                    type: 'lora',
+                    adapter_id: adapterId,
+                    adapter_path: adapterEntry?.adapter_path || (adapterId ? `lora_models/${adapterId}` : ''),
+                    character_style: card.querySelector('.lora-character-style').value,
+                    seed: "-1"
+                };
+            } else if (type === 'design') {
+                config = {
+                    type: 'design',
+                    description: card.querySelector('.design-description').value,
+                    seed: "-1"
+                };
+            }
+
+            // Include alias_of if set
+            if (alias) {
+                config.alias_of = alias;
+            }
+            return config;
+        }
+
         function collectVoiceConfig() {
-            const cards = document.querySelectorAll('.voice-card');
             const config = {};
-
-            cards.forEach(card => {
-                const name = card.dataset.voice;
-                const alias = card.querySelector('.alias-select') ? card.querySelector('.alias-select').value : '';
-                const type = card.querySelector('.voice-type:checked').value;
-
-                if (type === 'custom') {
-                    config[name] = {
-                        type: 'custom',
-                        voice: card.querySelector('.voice-select').value,
-                        character_style: card.querySelector('.character-style').value,
-                        seed: "-1"
-                    };
-                } else if (type === 'clone') {
-                    config[name] = {
-                        type: 'clone',
-                        ref_text: card.querySelector('.ref-text').value,
-                        ref_audio: card.querySelector('.ref-audio').value,
-                        seed: "-1"
-                    };
-                } else if (type === 'builtin_lora') {
-                    const adapterId = card.querySelector('.builtin-lora-select').value;
-                    const adapterEntry = (window._loraModelsCache || []).find(m => m.id === adapterId);
-                    config[name] = {
-                        type: 'builtin_lora',
-                        adapter_id: adapterId,
-                        adapter_path: adapterEntry?.adapter_path || '',
-                        character_style: card.querySelector('.builtin-lora-style').value,
-                        seed: "-1"
-                    };
-                } else if (type === 'lora') {
-                    const adapterId = card.querySelector('.lora-adapter-select').value;
-                    const adapterEntry = (window._loraModelsCache || []).find(m => m.id === adapterId);
-                    config[name] = {
-                        type: 'lora',
-                        adapter_id: adapterId,
-                        adapter_path: adapterEntry?.adapter_path || (adapterId ? `lora_models/${adapterId}` : ''),
-                        character_style: card.querySelector('.lora-character-style').value,
-                        seed: "-1"
-                    };
-                } else if (type === 'design') {
-                    config[name] = {
-                        type: 'design',
-                        description: card.querySelector('.design-description').value,
-                        seed: "-1"
-                    };
-                }
-                // Include alias_of if set
-                if (alias) {
-                    config[name].alias_of = alias;
-                }
+            document.querySelectorAll('.voice-card').forEach(card => {
+                config[card.dataset.voice] = collectCardConfig(card);
             });
             return config;
         }
+
+        // --- Voice preview ---
+        // Renders one short line with the card's current settings (including a
+        // freshly pinned seed) so a voice can be auditioned without rendering
+        // the whole book.
+        window.previewVoice = async (btn) => {
+            const card = btn.closest('.voice-card');
+            const speaker = card.dataset.voice;
+            const statusEl = document.getElementById('voice-preview-status');
+            const audioSlot = card.querySelector('.voice-preview-audio');
+            const text = (document.getElementById('voice-preview-text')?.value || '').trim();
+            const icon = btn.querySelector('i');
+            const prevIcon = icon ? icon.className : '';
+
+            btn.disabled = true;
+            if (icon) icon.className = 'fas fa-spinner fa-spin';
+            if (statusEl) statusEl.innerHTML = `<i class="fas fa-spinner fa-spin me-1"></i>Generating preview for ${escapeHtml(speaker)}...`;
+            try {
+                const result = await API.post('/api/voice_preview', {
+                    speaker,
+                    config: collectCardConfig(card),
+                    text,
+                });
+                if (audioSlot) {
+                    audioSlot.innerHTML = `<audio controls autoplay src="${result.audio_url}" style="height:32px;max-width:100%;"></audio>`;
+                }
+                if (statusEl) statusEl.innerText = `Preview ready: ${speaker}`;
+            } catch (e) {
+                showToast('Preview failed: ' + e.message, 'error');
+                if (statusEl) statusEl.innerText = '';
+            } finally {
+                btn.disabled = false;
+                if (icon) icon.className = prevIcon;
+            }
+        };
 
         let _voiceSaveTimer = null;
         function debouncedSaveVoices() {

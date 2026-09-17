@@ -24,6 +24,7 @@ from math import ceil
 
 # Import ProjectManager
 from project import ProjectManager
+from tts import sanitize_filename
 from default_prompts import load_default_prompts
 from review_prompts import load_review_prompts
 from persona_prompts import load_persona_prompts
@@ -52,6 +53,7 @@ LORA_MODELS_DIR = os.path.join(ROOT_DIR, "lora_models")
 LORA_DATASETS_DIR = os.path.join(ROOT_DIR, "lora_datasets")
 BUILTIN_LORA_DIR = os.path.join(ROOT_DIR, "builtin_lora")
 DATASET_BUILDER_DIR = os.path.join(ROOT_DIR, "dataset_builder")
+VOICE_PREVIEW_DIR = os.path.join(ROOT_DIR, "voice_previews")
 PREPARER_SCRIPT_PATH = os.path.join(BASE_DIR, "alexandria_preparer.py")
 PREPARER_OUTPUT_DIR = os.path.join(ROOT_DIR, "preparer_output")
 
@@ -62,6 +64,7 @@ os.makedirs(CLONE_VOICES_DIR, exist_ok=True)
 os.makedirs(LORA_MODELS_DIR, exist_ok=True)
 os.makedirs(LORA_DATASETS_DIR, exist_ok=True)
 os.makedirs(DATASET_BUILDER_DIR, exist_ok=True)
+os.makedirs(VOICE_PREVIEW_DIR, exist_ok=True)
 os.makedirs(PREPARER_OUTPUT_DIR, exist_ok=True)
 
 # Mount static files with absolute path
@@ -89,6 +92,9 @@ app.mount("/builtin_lora", StaticFiles(directory=BUILTIN_LORA_DIR), name="builti
 
 # Dataset builder directory for preview audio
 app.mount("/dataset_builder", StaticFiles(directory=DATASET_BUILDER_DIR), name="dataset_builder")
+
+# Voice preview audio (Voice Configuration tab)
+app.mount("/voice_previews", StaticFiles(directory=VOICE_PREVIEW_DIR), name="voice_previews")
 
 # Initialize Project Manager
 project_manager = ProjectManager(ROOT_DIR)
@@ -299,6 +305,15 @@ class ChunkUpdate(BaseModel):
 
 class BatchGenerateRequest(BaseModel):
     indices: List[int]
+
+class VoicePreviewRequest(BaseModel):
+    speaker: str = ""
+    # Current card settings from the UI, so an edited-but-not-yet-saved card
+    # previews exactly what the user sees. Overrides what is stored on disk.
+    config: Optional[VoiceConfigItem] = None
+    text: Optional[str] = None      # empty = a default line for the TTS language
+    instruct: Optional[str] = None  # optional per-line emotion for the preview
+    language: Optional[str] = None  # empty = use the configured TTS language
 
 class VoiceDesignPreviewRequest(BaseModel):
     description: str
@@ -980,6 +995,111 @@ async def save_voice_config(config_data: Dict[str, VoiceConfigItem]):
     atomic_json_write(current_config, VOICE_CONFIG_PATH)
 
     return {"status": "saved"}
+
+# One short sample line per language, so a preview is spoken in the configured
+# TTS language rather than always in English.
+VOICE_PREVIEW_TEXTS = {
+    "english": "Hello, this is a short preview of how this voice sounds.",
+    "chinese": "你好，这是这个角色声音的试听样例。",
+    "japanese": "こんにちは、この声のサンプルです。",
+    "korean": "안녕하세요, 이 목소리의 샘플입니다.",
+    "french": "Bonjour, voici un court aperçu de cette voix.",
+    "german": "Hallo, dies ist eine kurze Hörprobe dieser Stimme.",
+    "spanish": "Hola, esta es una breve muestra de esta voz.",
+    "italian": "Ciao, questa è una breve anteprima di questa voce.",
+    "portuguese": "Olá, esta é uma breve prévia desta voz.",
+    "russian": "Здравствуйте, это короткий пример этого голоса.",
+}
+
+def _default_voice_preview_text(language):
+    return VOICE_PREVIEW_TEXTS.get(
+        (language or "").strip().lower(), VOICE_PREVIEW_TEXTS["english"]
+    )
+
+@app.post("/api/voice_preview")
+async def voice_preview(request: VoicePreviewRequest):
+    """Render one short line with a voice card's current settings.
+
+    This is what the Preview button on each voice card calls: it makes a voice
+    audible without rendering the whole book, which is also how a pinned seed or
+    a character style is auditioned before committing to it.
+    """
+    for task in ("audio", "dataset_gen", "dataset_builder"):
+        if process_state[task]["running"]:
+            raise HTTPException(
+                status_code=409,
+                detail=f"'{task}' generation is already running — wait for it to finish before previewing a voice",
+            )
+
+    speaker = (request.speaker or "").strip()
+
+    stored_config = {}
+    if os.path.exists(VOICE_CONFIG_PATH):
+        try:
+            with open(VOICE_CONFIG_PATH, "r", encoding="utf-8") as f:
+                stored_config = json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            stored_config = {}
+
+    # Aliased speakers preview the voice they actually resolve to.
+    canonical = project_manager._resolve_alias(speaker, stored_config) if speaker else speaker
+    voice_data = dict(stored_config.get(canonical) or {})
+    if request.config:
+        # Only overwrite what the UI actually sends; legacy/extra keys such as
+        # default_style survive untouched.
+        voice_data.update(request.config.model_dump())
+    if not voice_data:
+        raise HTTPException(status_code=404, detail=f"No voice configuration for '{speaker}'")
+
+    text = (request.text or "").strip()
+    language = (request.language or "").strip()
+    if not text or not language:
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                app_config = json.load(f)
+        except (OSError, json.JSONDecodeError, ValueError):
+            app_config = {}
+        tts_cfg = app_config.get("tts") or {}
+        if not language:
+            language = str(tts_cfg.get("language") or "English")
+        if not text:
+            text = _default_voice_preview_text(language)
+
+    engine = project_manager.get_engine()
+    if not engine:
+        raise HTTPException(status_code=500, detail="Failed to initialize TTS engine")
+
+    filename = f"{sanitize_filename(canonical or speaker or 'voice')}_preview.wav"
+    output_path = os.path.join(VOICE_PREVIEW_DIR, filename)
+
+    logger.info(f"Voice preview: speaker='{canonical}' type={voice_data.get('type', 'custom')} "
+                f"voice={voice_data.get('voice')} seed={voice_data.get('seed')}")
+    try:
+        success = engine.generate_voice(
+            text=text,
+            instruct_text=request.instruct or "",
+            speaker=canonical,
+            voice_config={canonical: voice_data},
+            output_path=output_path,
+        )
+    except Exception as e:
+        logger.error(f"Voice preview failed for '{speaker}': {e}")
+        raise HTTPException(status_code=500, detail=f"Preview generation failed: {e}")
+
+    if not success or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Preview generation failed for '{speaker}' — check the TTS server "
+                   f"(mode/URL) and that the voice type matches the loaded checkpoint",
+        )
+
+    return {
+        "status": "ok",
+        "audio_url": f"/voice_previews/{filename}?t={int(time.time() * 1000)}",
+        "text": text,
+        "language": language,
+        "speaker": canonical,
+    }
 
 @app.get("/api/audiobook")
 async def get_audiobook():

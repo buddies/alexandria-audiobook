@@ -184,6 +184,8 @@ Web UI 显示的是高层状态，**详细日志在 Pinokio 终端中**：
 脚本中检测到的每个角色都会有一张声音卡片。为每个说话人：
 - 选择声音类型：Custom Voice（最简单）、Clone Voice、LoRA Voice 或 Voice Design
 - 使用 Custom Voice 时，从 9 个预设中选择（Ryan、Serena、Aiden 等），可选设置角色风格（例如"沉稳的旁白语调"）
+- **Seed（Custom Voice）** — 每张声音卡片都有 Seed 字段，用于固定角色音色：相同 seed + 相同预设每次都会生成完全一致的音色，角色不会在段落之间变成另一个人的声音。留空（或 `-1`）使用默认的按角色名固定种子；填入数字即可锁定当前满意的音色，或点击骰子按钮换一个 seed 后重新生成某句试听。优先级为：角色固定 seed → Batch Seed（Setup 页，仅 Fast batch 生效）→ 按角色名的稳定种子 → 随机；Editor、批量渲染与试听完全一致地遵循该优先级
+- **试听（Preview）** — 每张卡片的 Preview 按钮会用该卡当前设置（预设、角色风格、seed）生成一句短台词并就地播放，方便在正式渲染前确认音色、挑好固定的 seed。试听台词可在卡片上方的 "Preview line" 中统一填写，留空则使用与 TTS 语言对应的默认台词
 - **生成角色** — 点击后 LLM 分析脚本，为每个角色创建声音描述、生成参考音频并自动分配克隆声音。切换"Advanced"可控制批量大小。这是为所有角色分配独特声音的最快方式
 - **说话人别名** — 使用声音卡片上的"Alias of"下拉菜单将一个说话人映射到另一个角色的声音（例如将"年轻的艾琳娜"设为"艾琳娜"的别名）
 - 更改自动保存 — 各类型详细说明参见 [Voice Types](https://github.com/Finrandojin/alexandria-audiobook/wiki/Voice-Types)
@@ -228,6 +230,12 @@ Web UI 显示的是高层状态，**详细日志在 Pinokio 终端中**：
 - 确保有足够的显存（推荐 16 GB 以上 bfloat16）
 - 检查 voice_config.json 中所有说话人的设置是否有效
 - 克隆声音时，确认参考音频存在且转录文本准确
+
+### 每次 Regenerate All 得到的声音略有不同
+卡片上固定的 **Seed** 每次都会原样发送，但 TTS 服务端只有在请求不重叠时才能逐字节复现同一个
+seed。当 **Parallel Workers > 1** 时，同时有两个 chunk 在请求中，服务端的批处理会干扰采样，
+于是同一个 seed 也会生成不同的结果。需要重新生成完全可复现时，请到 Setup → TTS Settings 把
+**Parallel Workers 设为 1**（已验证：此时连续两次 Regenerate All 产出的音频逐字节一致）。
 
 ### 生成速度慢
 - 在设置中启用 **Compile Codec**（首次预热后速度提升 3-4 倍）

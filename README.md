@@ -199,6 +199,8 @@ Configure your LLM connection and TTS engine. At minimum you need:
 Each character detected in the script gets a voice card. For each speaker:
 - Choose a voice type: Custom Voice (easiest), Clone Voice, LoRA Voice, or Voice Design
 - For Custom Voice, pick from 9 presets (Ryan, Serena, Aiden, etc.) and optionally set a character style (e.g., "Heavy Scottish accent")
+- **Seed (Custom Voice)** — every voice card has a Seed field that pins the voice identity: the same seed and preset always render the exact same timbre, so one character never drifts into a different-sounding person. Leave it empty (or `-1`) to use the default stable per-speaker seed; type a number to keep a take you liked, or click the dice to roll a new one and re-generate a line to audition it. Precedence is: pinned per-voice seed → Batch Seed (Setup tab, Fast batch only) → stable per-speaker seed → random, and it is applied identically by the Editor, the batch renderer, and Preview
+- **Preview** — each card's Preview button renders one short line with that card's current settings (preset, character style, seed) and plays it inline, so a voice or a freshly rolled seed can be auditioned before rendering the book. Type the line once in the "Preview line" box above the cards; leave it empty to use a default line in the TTS language
 - **Generate Personas** — Click to have the LLM analyze the script, create voice descriptions for each character, generate reference audio, and assign clone voices automatically. Toggle "Advanced" for batch size control. This is the fastest way to assign unique voices to all characters
 - **Speaker Aliases** — Use the "Alias of" dropdown on any voice card to map a speaker to another character's voice (e.g., set "YOUNG ELENA" as alias of "ELENA"). Aliased speakers use the target's voice config during generation
 - Changes save automatically — see [Voice Types](https://github.com/Finrandojin/alexandria-audiobook/wiki/Voice-Types) for guidance on each type
@@ -903,7 +905,15 @@ Conda's bundled ffmpeg on Windows often lacks the MP3 encoder (libmp3lame). Alex
 ### Audio quality issues
 - Use 5-15 second clear reference audio for cloning
 - Avoid background noise in reference samples
-- Try different seeds for custom voices
+- Try different seeds for custom voices — the **Seed** field on each voice card pins a timbre you like (click the dice to audition another one)
+
+### Regenerate All / Render Pending gives a slightly different voice each run
+A pinned **Seed** is sent unchanged on every request, but the TTS server only reproduces a
+seed byte-for-byte while requests are handled one at a time. With **Parallel Workers > 1**
+two chunks are in flight at once and the server's batching perturbs sampling, so the same
+seed yields a different take. Set **Parallel Workers to 1** under Setup → TTS Settings when
+you need a regeneration to be exactly repeatable (verified: two consecutive Regenerate All
+runs then produce byte-identical audio).
 
 ### Mojibake characters in output
 - The system automatically fixes common encoding issues

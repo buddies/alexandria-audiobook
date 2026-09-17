@@ -321,6 +321,20 @@ class TTSEngine:
         """Join-smoothing settings (trim / level match / fade) for this engine."""
         return dict(self._join_config)
 
+    @staticmethod
+    def _explicit_seed(voice_data):
+        """Return the seed the user pinned for this voice, or None.
+
+        ``-1``, an empty string or a missing key all mean "not pinned" and fall
+        through to the session batch seed / the stable per-speaker seed.
+        """
+        voice_data = voice_data or {}
+        try:
+            seed = int(str(voice_data.get("seed", -1)).strip() or -1)
+        except (TypeError, ValueError):
+            return None
+        return seed if seed >= 0 else None
+
     def _resolve_seed(self, voice_data, speaker, batch_seed=None):
         """Pick the random seed for one generation request.
 
@@ -331,11 +345,8 @@ class TTSEngine:
         random seed, which is a major cause of one voice sounding like a
         different person from one chunk to the next.
         """
-        try:
-            explicit = int(str(voice_data.get("seed", -1)).strip() or -1)
-        except (TypeError, ValueError):
-            explicit = -1
-        if explicit >= 0:
+        explicit = self._explicit_seed(voice_data)
+        if explicit is not None:
             return explicit
         if batch_seed is not None:
             try:
@@ -1084,7 +1095,8 @@ class TTSEngine:
             return self.generate_clone_voice(text, speaker, voice_config, output_path,
                                              batch_seed=batch_seed)
         elif voice_type in ("lora", "builtin_lora"):
-            return self.generate_lora_voice(text, instruct_text, voice_data, output_path)
+            return self.generate_lora_voice(text, instruct_text, voice_data, output_path,
+                                            batch_seed=batch_seed)
         elif voice_type == "design":
             return self.generate_design_voice(text, instruct_text, voice_data, output_path)
         else:
@@ -1173,7 +1185,14 @@ class TTSEngine:
             print("Warning: Design voice has no description or instruct. Using generic.")
             description = "A clear, natural speaking voice"
 
-        wav_path, sr = self.generate_voice_design(description=description, sample_text=text)
+        # A seed pinned on the voice card applies here too; -1 keeps the previous
+        # "let the engine pick" behaviour (0 is a valid seed, so test for None).
+        pinned = self._explicit_seed(voice_data)
+        wav_path, sr = self.generate_voice_design(
+            description=description,
+            sample_text=text,
+            seed=pinned if pinned is not None else -1,
+        )
         shutil.copy2(wav_path, output_path)
         return True
 
@@ -1367,7 +1386,7 @@ class TTSEngine:
         # Process clone voice chunks (batched by speaker in local mode)
         if clone_chunks:
             if self._mode == "local":
-                batch_results = self._local_batch_clone(clone_chunks, voice_config, output_dir)
+                batch_results = self._local_batch_clone(clone_chunks, voice_config, output_dir, batch_seed)
             else:
                 batch_results = {"completed": [], "failed": []}
                 for chunk in clone_chunks:
@@ -1391,7 +1410,7 @@ class TTSEngine:
         # Process LoRA voice chunks (batched by adapter in local mode)
         if lora_chunks:
             if self._mode == "local":
-                batch_results = self._local_batch_lora(lora_chunks, voice_config, output_dir)
+                batch_results = self._local_batch_lora(lora_chunks, voice_config, output_dir, batch_seed)
             else:
                 batch_results = {"completed": [], "failed": []}
                 for chunk in lora_chunks:
@@ -1548,6 +1567,41 @@ class TTSEngine:
             traceback.print_exc()
             return False
 
+    def _split_by_pinned_seed(self, chunks, voice_config):
+        """Decide how pinned per-voice seeds split a batch run.
+
+        The native batch API accepts one seed per call, so a pinned seed can only
+        be honoured when the chunks needing it are generated on their own. Chunks
+        whose speaker does not pin a seed stay together in a ``None`` group and
+        keep the previous single-batch behaviour.
+
+        Returns ``(groups, single_seed)``:
+          - ``groups`` is a list of ``(seed_or_None, chunks)`` when the run has to
+            be split, otherwise None;
+          - ``single_seed`` is the one seed the whole run shares when no split is
+            needed (None when nothing is pinned).
+        """
+        pinned = {}
+        unpinned = []
+        for chunk in chunks:
+            voice_data = voice_config.get(chunk.get("speaker", ""), {})
+            seed = self._explicit_seed(voice_data)
+            if seed is None:
+                unpinned.append(chunk)
+            else:
+                pinned.setdefault(seed, []).append(chunk)
+
+        # The unpinned chunks form one implicit group of their own.
+        if len(pinned) + (1 if unpinned else 0) <= 1:
+            # At most one seed is in play for the whole run, so nothing to split;
+            # the caller just has to apply that seed to the single batch.
+            return None, (next(iter(pinned)) if pinned else None)
+
+        groups = [(seed, group) for seed, group in pinned.items()]
+        if unpinned:
+            groups.append((None, unpinned))
+        return groups, None
+
     def _local_batch_custom(self, chunks, voice_config, output_dir, batch_seed=-1):
         """Batch generate custom voice using native list API with sub-batching.
 
@@ -1556,9 +1610,37 @@ class TTSEngine:
         sorted by text length and split into sub-batches when the length ratio
         exceeds the configured threshold. Sub-batching can be disabled entirely
         via config, in which case everything runs as one batch.
+
+        The native batch call also takes a single seed for the whole call, so
+        chunks whose speaker pins an explicit seed are generated in their own
+        group - otherwise a pinned voice would be re-rolled by the batch seed.
         """
         import torch
         import time
+
+        grouped, single_seed = self._split_by_pinned_seed(chunks, voice_config)
+        if grouped is not None:
+            print(f"Batch [local]: splitting into {len(grouped)} seed group(s) "
+                  f"to honour pinned voice seeds")
+            # A pinned group re-seeds the global RNG, so snapshot the state here
+            # and restore it before every unpinned group: those voices must keep
+            # the same entropy they would have had in an unsplit run instead of
+            # inheriting whatever the last pinned group left behind.
+            rng_state = torch.get_rng_state()
+            results = {"completed": [], "failed": []}
+            for group_seed, group_chunks in grouped:
+                if group_seed is None:
+                    torch.set_rng_state(rng_state)
+                sub = self._local_batch_custom(
+                    group_chunks, voice_config, output_dir,
+                    batch_seed=group_seed if group_seed is not None else batch_seed,
+                )
+                results["completed"].extend(sub["completed"])
+                results["failed"].extend(sub["failed"])
+            return results
+        if single_seed is not None:
+            # Every chunk shares one pinned seed; apply it to the whole batch.
+            batch_seed = single_seed
 
         results = {"completed": [], "failed": []}
 
@@ -1683,7 +1765,7 @@ class TTSEngine:
 
         return results
 
-    def _local_batch_clone(self, chunks, voice_config, output_dir):
+    def _local_batch_clone(self, chunks, voice_config, output_dir, batch_seed=-1):
         """Batch generate clone voices, grouped by speaker.
 
         Chunks sharing the same speaker (same reference audio) are batched
@@ -1746,9 +1828,12 @@ class TTSEngine:
             print(f"Batch [clone] speaker='{speaker}': {len(texts)} chunks "
                   f"in {len(sub_batches)} sub-batch(es)")
 
-            # One seed per speaker keeps the identity stable across sub-batches.
-            if self._deterministic_seed:
-                torch.manual_seed(stable_seed_for_speaker(speaker))
+            # Same precedence as the single-chunk clone path: a seed pinned on
+            # the voice card wins, then the session batch seed, then one stable
+            # seed per speaker so the identity holds across sub-batches.
+            seed = self._resolve_seed(voice_config.get(speaker, {}), speaker, batch_seed)
+            if seed >= 0:
+                torch.manual_seed(seed)
 
             for sb_idx, (start, end) in enumerate(sub_batches):
                 sb_texts = texts[start:end]
@@ -1804,7 +1889,7 @@ class TTSEngine:
 
         return results
 
-    def _local_batch_lora(self, chunks, voice_config, output_dir):
+    def _local_batch_lora(self, chunks, voice_config, output_dir, batch_seed=-1):
         """Batch generate LoRA voices, grouped by adapter.
 
         Chunks sharing the same adapter are batched together through
@@ -1857,9 +1942,14 @@ class TTSEngine:
                     results["failed"].append((chunk["index"], f"Adapter not found: {adapter_path}"))
                 continue
 
-            # One seed per adapter keeps the identity stable across sub-batches.
-            if self._deterministic_seed:
-                torch.manual_seed(stable_seed_for_speaker(os.path.basename(adapter_path)))
+            # Same precedence as the single-chunk LoRA path: a pinned per-voice
+            # seed wins, then the session batch seed, then one stable seed per
+            # adapter so the identity holds across sub-batches.
+            seed = self._resolve_seed(
+                voice_data, os.path.basename(adapter_path), batch_seed
+            )
+            if seed >= 0:
+                torch.manual_seed(seed)
 
             # Load adapter and build/get clone prompt
             try:

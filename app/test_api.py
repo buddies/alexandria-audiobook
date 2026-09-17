@@ -463,6 +463,13 @@ def test_save_voice_config():
         raise TestFailure(f"Expected status=saved, got {data}")
 
 
+def test_voice_preview_unknown_speaker():
+    # An unknown speaker is rejected before any TTS work happens, so this stays a
+    # quick test (the happy path needs --full).
+    r = post("/api/voice_preview", json={"speaker": f"{TEST_PREFIX}nobody"})
+    assert_status(r, 404)
+
+
 # ── Section 7: Chunks ───────────────────────────────────────
 
 def test_get_chunks():
@@ -1242,6 +1249,7 @@ def run_all_tests():
     section("Voices")
     run_test("get_voices", test_get_voices)
     run_test("save_voice_config", test_save_voice_config)
+    run_test("voice_preview_unknown_speaker", test_voice_preview_unknown_speaker)
 
     section("Chunks")
     run_test("get_chunks", test_get_chunks)
