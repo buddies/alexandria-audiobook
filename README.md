@@ -319,6 +319,13 @@ Aliases resolve transitively (A → B → C uses C's config) with cycle detectio
 - Each line's instruct is appended as delivery/emotion direction
 - Generates voice on-the-fly using the VoiceDesign model — ideal for minor characters
 
+**The `instruct` field (Emotion / Style):** the engine tokenizes this value as a one-line *instruction to the speaker*, so it must say what the voice should do — not what the scene means. The pipeline enforces this from code, not only from the editable prompt, so it also holds for a hand-written system prompt:
+
+- **Allowed:** emotional tone, delivery, pacing/articulation — one short clause (≤ 10 English words / ≤ 16 Chinese characters, at most three comma-separated parts)
+- **Forbidden:** timbre, register, age, gender or accent (that is the voice's permanent identity and lives in **Character Style**), physical actions or gestures, descriptions of the scene or of what the line "shows", bracketed stage directions, quotes, ellipses, and the speaker's own name
+- Prefer concrete delivery wording over vague energy wording: measured on this project, an explicit rate instruction ("语速极慢，拖长音") made takes 10-28 % longer across three different texts, while a director's note with no acoustic target moved nothing consistently. The voice cannot act on "强调事件的诡异"
+- Each generation run prints an audit line in the Script tab log, e.g. `[instruct audit:final] 17/36 line(s) need attention: scene=8, action=6, no_delivery=5`, with the offending lines quoted. Format problems (stray quotes, a `旁白：` prefix, doubled punctuation, over-length) are cleaned automatically; semantic problems are what the audit reports and what the review pass fixes
+
 **Character Styles (the voice identity anchor):**
 - Every customization mode has a Character Style field. Whatever it holds is appended to each line's per-line instruct before the request is sent, so it is the one part of the instruction that describes *who the character is* rather than what they are feeling in that line
 - Write it as acoustics only — voice type, register, timbre, texture, baseline pace (e.g. "Male voice in his fifties, low baritone register, dry timbre, deliberate pace"). Never put emotion or delivery words there: the engine regenerates the voice from the whole instruction string, so an emotional anchor moves the timbre itself and you lose the per-line control you were paying for

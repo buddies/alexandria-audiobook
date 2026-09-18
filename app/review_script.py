@@ -6,6 +6,7 @@ import argparse
 from openai import OpenAI
 from review_prompts import REVIEW_SYSTEM_PROMPT, REVIEW_USER_PROMPT
 from generate_script import clean_json_string, repair_json_array, salvage_json_entries
+from instruct_utils import apply_instruct_rules, audit_entries, format_audit, normalize_entries
 from script_language import apply_language, is_narrator_label, language_context, safe_format
 from llm_utils import (
     analyze_response,
@@ -89,7 +90,9 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                  min_p=0, presence_penalty=0.0, banned_tokens=None, lang_ctx=None):
     """Send a batch of script entries through the LLM for review and correction."""
     lang_ctx = lang_ctx or language_context("")
-    sys_prompt = apply_language(system_prompt or REVIEW_SYSTEM_PROMPT, lang_ctx)
+    sys_prompt = apply_instruct_rules(
+        apply_language(system_prompt or REVIEW_SYSTEM_PROMPT, lang_ctx), review=True
+    )
     usr_template = user_prompt_template or REVIEW_USER_PROMPT
 
     # Build context
@@ -431,6 +434,7 @@ def main():
                 previous_tail = batch[-2:] if len(batch) >= 2 else batch
                 continue
 
+            corrected, _normalized = normalize_entries(corrected)
             passed, orig_text, corr_text, ratio = check_text_loss(batch, corrected, threshold=0.95, upper_bound=1.15)
             if not passed:
                 print(f"  WARNING: Text length mismatch (loss or gain)! Word ratio: {ratio:.2f} (acceptable range: 0.95-1.15)")
@@ -504,6 +508,7 @@ def main():
                 previous_tail = batch[-2:] if len(batch) >= 2 else batch
                 continue
 
+            corrected, _normalized = normalize_entries(corrected)
             # Text-loss safety check
             passed, orig_text, corr_text, ratio = check_text_loss(batch, corrected)
             if not passed:
@@ -544,6 +549,8 @@ def main():
             previous_tail = corrected[-2:] if len(corrected) >= 2 else corrected
 
     # Post-processing: merge consecutive NARRATOR entries with same instruct
+    # (after normalization, so two instructs that only differ by stray quotes or
+    # whitespace still count as the same direction)
     merge_narrators_enabled = generation_config.get("merge_narrators", False)
     narrator_merges = 0
     if merge_narrators_enabled:
@@ -589,6 +596,7 @@ def main():
         print(f"Fixed {total_changes} issues across {total_batches} batches.")
 
     print(f"Output saved to: {script_path}")
+    print(format_audit(audit_entries(all_corrected, "final"), examples=True))
     print("Task review completed successfully.")
 
 

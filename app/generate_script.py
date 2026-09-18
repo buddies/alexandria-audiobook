@@ -5,6 +5,12 @@ import re
 import argparse
 from openai import OpenAI
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
+from instruct_utils import (
+    apply_instruct_rules,
+    audit_entries,
+    format_audit,
+    normalize_entries,
+)
 from script_language import (
     apply_language,
     default_instruct_for,
@@ -243,7 +249,9 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
     """Process a text chunk and return JSON script entries"""
     # Use provided prompts or fall back to defaults
     lang_ctx = lang_ctx or language_context("")
-    sys_prompt = apply_language(system_prompt or DEFAULT_SYSTEM_PROMPT, lang_ctx)
+    # Language first, then the Emotion / Style rules, so the field rules sit last
+    # in the prompt (they are the ones a custom prompt is most likely to violate).
+    sys_prompt = apply_instruct_rules(apply_language(system_prompt or DEFAULT_SYSTEM_PROMPT, lang_ctx))
     usr_template = user_prompt_template or DEFAULT_USER_PROMPT
 
     context_parts = []
@@ -562,7 +570,11 @@ def main():
     if not all_entries:
         print("Error: No script entries generated")
         sys.exit(1)
-
+    # Clean what the model wrote and say how well it followed the field rules.
+    _, normalized = normalize_entries(all_entries)
+    if normalized:
+        print(f"Normalized the Emotion / Style field on {normalized} entry(ies)")
+    print(format_audit(audit_entries(all_entries, "final"), examples=True))
     _write_script_output(all_entries)
 
 

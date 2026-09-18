@@ -69,11 +69,15 @@ FIXES TO APPLY:
    - NARRATOR: Must be "Neutral, even narration." or a single tonal variant matching the scene ("Tense, clipped narration.", "Quiet, somber narration.", "Wry, light narration."). Fix any narrator instruct that describes character emotions, physical actions, or reads like a character direction.
      WRONG: "With a sense of foreboding and dread." → RIGHT: "Dark, heavy narration."
      WRONG: "Neutral, even narration." during a tense chase scene → acceptable to leave as-is OR upgrade to "Tense, urgent narration." — but never downgrade a valid tonal variant back to neutral.
-   - CHARACTER: Instructs should describe the VOICE using emotion, delivery, and vocal quality (~8-15 words). Replace physical descriptions with vocal equivalents:
+   - CHARACTER: Instructs describe the VOICE's performance with emotion, delivery and pacing, in ONE short clause (<= 10 words / <= 16 Chinese characters, at most two comma-separated parts). Replace physical descriptions with vocal equivalents:
      WRONG: "Trembling with shock." → RIGHT: "Shocked, voice cracking with disbelief."
-     WRONG: "Leaning forward eagerly." → RIGHT: "Eager, bright energy, words tumbling out."
+     WRONG: "Leaning forward eagerly." → RIGHT: "Eager, words tumbling out."
      WRONG: "He tries to sound casual." → RIGHT: "Forced casual tone, not quite selling it."
-   - Do NOT shorten or simplify instructs that are already valid voice descriptions. A rich instruct like "Cold fury, barely contained, voice tight" is correct and should not be reduced.
+   - Fix these two failure modes wherever you see them:
+     (a) TIMBRE OR IDENTITY IN THE INSTRUCT — gravelly, breathy, low-pitched, young, 沙哑, 浑厚, 音色, 年近五旬. The per-line field must not restate the voice's permanent identity; drop that part and keep the performance direction. Permanent identity belongs to the voice's Character Style, which is applied separately.
+         WRONG: "年轻，疲惫，慵懒且略带戏谑的声音。" → RIGHT: "疲惫，慵懒，略带戏谑。"
+     (b) A NOTE THE VOICE CANNOT ACT ON — scene meaning, what the line "shows", or a description of the text ("中性，平稳的场景描述。", "突出时间的紧迫和事件的诡异。"). Replace it with the delivery that would create that effect ("平稳，克制。", "急促，语速加快。").
+   - Split or shorten over-specified instructs: four or more comma-separated qualities must become three or fewer, keeping the qualities that actually change the delivery. Do NOT add new qualities while shortening, and do NOT lengthen a valid instruct.
 ---SEPARATOR---
 {context}
 

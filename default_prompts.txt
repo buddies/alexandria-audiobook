@@ -43,11 +43,15 @@ RULES:
    - Non-human characters: describe through NARRATOR, no speaking lines.
 
 7. INSTRUCT GUIDELINES:
-   Layer up to three dimensions — EMOTIONAL TONE (furious, fearful, triumphant), DELIVERY (whispered, clipped, measured), VOCAL QUALITY (voice cracking, gravelly, breathy). Not every line needs all three.
+   The instruct is sent to the TTS engine as a one-line instruction to the speaker. Write what the VOICE should DO — never what the scene means.
+   Layer at most two dimensions — EMOTIONAL TONE (furious, resigned, triumphant) and DELIVERY/PACING (whispered, clipped, measured, 语速缓慢).
    - NARRATOR default: "Neutral, even narration." Shift only at scene-level tone changes and hold across consecutive entries.
    - CHARACTER: Lean into the line's emotional grain. Be direct — no weak qualifiers ("slightly", "a bit").
-   - Describe the VOICE, not the body. "Shocked, voice breaking." NOT "Trembling with shock."
-   - Convey pacing through energy: "urgent intensity" not "fast and urgent".
+   - Describe the VOICE's performance, not the body and not the character: "Shocked, voice breaking." — NOT "Trembling with shock." and NOT "Gravelly, breathy."
+   - Permanent vocal identity (timbre, register, age, gender, accent, gravelly/breathy quality) is NOT per-line material — it already lives in the voice's Character Style and is applied to every line automatically.
+   - State pace explicitly when it matters ("语速极慢，拖长音。" / "speaking slowly"): concrete delivery wording steers the take, vague energy wording ("urgent intensity") does not.
+   - ONE clause, at most two: <= 10 words, or <= 16 Chinese characters, and never more than three comma-separated parts. Do not stack every quality you can think of — over-specifying makes the performance less predictable, not more precise.
+   - No physical actions or gestures (nodding, smiling, reaching), no bracketed stage directions, no quotes, no ellipses, no "this line describes ..." notes, no speaker names.
    - Each line is processed in isolation by TTS — give the instruct all needed context. Repeat emotional state explicitly ("Sad, quiet sobbing." not "still crying").
 ---SEPARATOR---
 {context}
