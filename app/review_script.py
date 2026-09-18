@@ -6,6 +6,7 @@ import argparse
 from openai import OpenAI
 from review_prompts import REVIEW_SYSTEM_PROMPT, REVIEW_USER_PROMPT
 from generate_script import clean_json_string, repair_json_array, salvage_json_entries
+from script_language import apply_language, is_narrator_label, language_context, safe_format
 from llm_utils import (
     analyze_response,
     next_max_tokens,
@@ -41,7 +42,9 @@ def merge_consecutive_narrators(entries, max_merged_length=800):
     while i < len(entries):
         entry = entries[i]
 
-        if entry.get("speaker") != "NARRATOR" or _is_section_break(entry.get("text", "")):
+        # Recognise narration in any language ("NARRATOR", "旁白", ...) instead of
+        # comparing against one hard-coded spelling.
+        if not is_narrator_label(entry.get("speaker")) or _is_section_break(entry.get("text", "")):
             merged.append(entry)
             i += 1
             continue
@@ -54,7 +57,7 @@ def merge_consecutive_narrators(entries, max_merged_length=800):
 
         while j < len(entries):
             next_entry = entries[j]
-            if next_entry.get("speaker") != "NARRATOR":
+            if not is_narrator_label(next_entry.get("speaker")):
                 break
             if next_entry.get("instruct", "") != instruct:
                 break
@@ -68,7 +71,7 @@ def merge_consecutive_narrators(entries, max_merged_length=800):
             j += 1
 
         merged.append({
-            "speaker": "NARRATOR",
+            "speaker": entry.get("speaker"),  # keep whatever narrator label this script uses
             "text": combined_text,
             "instruct": instruct
         })
@@ -83,9 +86,10 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                  previous_tail=None, source_context=None, max_retries=2,
                  system_prompt=None, user_prompt_template=None,
                  max_tokens=8000, temperature=0.4, top_p=0.8, top_k=20,
-                 min_p=0, presence_penalty=0.0, banned_tokens=None):
+                 min_p=0, presence_penalty=0.0, banned_tokens=None, lang_ctx=None):
     """Send a batch of script entries through the LLM for review and correction."""
-    sys_prompt = system_prompt or REVIEW_SYSTEM_PROMPT
+    lang_ctx = lang_ctx or language_context("")
+    sys_prompt = apply_language(system_prompt or REVIEW_SYSTEM_PROMPT, lang_ctx)
     usr_template = user_prompt_template or REVIEW_USER_PROMPT
 
     # Build context
@@ -103,7 +107,7 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
 
     context = "\n".join(context_parts)
     batch_json = json.dumps(batch_entries, indent=2, ensure_ascii=False)
-    user_prompt = usr_template.format(context=context, batch=batch_json)
+    user_prompt = safe_format(usr_template, lang_ctx, context=context, batch=batch_json)
 
     # Output budget for this batch. Thinking output is charged against it, so a
     # truncated reply is retried with a bigger budget instead of being accepted.
@@ -359,6 +363,15 @@ def main():
 
     client = OpenAI(base_url=base_url, api_key=api_key)
 
+    # The review pass must write labels and directions in the same language the
+    # script was generated in, or it would "fix" them back into English.
+    lang_ctx = language_context(
+        (config.get("tts", {}) or {}).get("language"),
+        generation_config.get("narrator_label", ""),
+    )
+    print(f"Script language: {lang_ctx['display_language']} "
+          f"(narrator label: {lang_ctx['narrator_label']})")
+
     all_corrected = []
     total_stats = {
         "text_changed": 0,
@@ -407,7 +420,8 @@ def main():
                 top_k=top_k,
                 min_p=min_p,
                 presence_penalty=presence_penalty,
-                banned_tokens=banned_tokens
+                banned_tokens=banned_tokens,
+                lang_ctx=lang_ctx,
             )
 
             if corrected is None:
@@ -479,7 +493,8 @@ def main():
                 top_k=top_k,
                 min_p=min_p,
                 presence_penalty=presence_penalty,
-                banned_tokens=banned_tokens
+                banned_tokens=banned_tokens,
+                lang_ctx=lang_ctx,
             )
 
             if corrected is None:

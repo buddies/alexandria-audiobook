@@ -11,6 +11,7 @@ from openai import OpenAI
 from tts import TTSEngine, sanitize_filename
 from utils import atomic_json_write as _atomic_json_write
 from persona_prompts import PERSONA_SYSTEM_PROMPT, PERSONA_USER_PROMPT, PERSONA_ADVANCED_PROMPT
+from script_language import apply_language, description_language_context, is_narrator_label, safe_format
 from llm_utils import analyze_response, reasoning_warning
 
 
@@ -118,7 +119,10 @@ def _resolve_to_canonical(raw_name: str, allowed: list, threshold=0.4) -> str | 
     return None
 
 
-_NARRATOR_LABELS = frozenset({"NARRATOR", "NARRATION", "NARRATIVE"})
+# Narration is recognised through script_language.is_narrator_label(), which
+# understands every narrator label this app may have produced ("NARRATOR",
+# "旁白", ...). Comparing against one spelling would silently drop the narrator
+# context as soon as the script language changed.
 
 
 def _collect_narrator_context(script, speaker, window=4):
@@ -126,7 +130,7 @@ def _collect_narrator_context(script, speaker, window=4):
 
     - Scans both before and after each appearance.
     - Looks at all appearances, not just the first.
-    - Accepts any speaker labels in _NARRATOR_LABELS.
+    - Accepts any speaker label that script_language.is_narrator_label() recognises.
     """
     context_lines = []
     seen_lines = set()
@@ -149,7 +153,7 @@ def _collect_narrator_context(script, speaker, window=4):
             entry = script[j]
             entry_speaker = _entry_speaker(entry).upper()
             entry_text = _entry_text(entry)
-            if entry_speaker in _NARRATOR_LABELS and entry_text:
+            if is_narrator_label(entry_speaker) and entry_text:
                 if entry_text not in seen_lines:
                     seen_lines.add(entry_text)
                     context_lines.append(entry_text)
@@ -408,7 +412,7 @@ def _fallback_batch_characters(batch):
     return list(by_speaker.values())
 
 
-def _compile_character_prompt(character_ref, prompt_template=None):
+def _compile_character_prompt(character_ref, prompt_template=None, lang_ctx=None):
     compact = {
         "name": character_ref.get("name", ""),
         "aliases": character_ref.get("aliases", [])[:20],
@@ -420,14 +424,15 @@ def _compile_character_prompt(character_ref, prompt_template=None):
         "observations": character_ref.get("observations", [])[-30:],
     }
     if prompt_template:
-        return prompt_template.format(character_ref=_json_preview(compact))
-    return (
+        return safe_format(prompt_template, lang_ctx, character_ref=_json_preview(compact))
+    return apply_language(
         "You are compiling an audiobook character reference into a final TTS voice persona.\n"
         "Use only supported observations. The final description should be practical for voice design.\n"
         "Return ONLY one JSON object with keys:\n"
         "- description: 2-4 sentences covering apparent age/gender if inferable, timbre, accent/dialect, pace, emotional baseline, personality, and delivery guidance.\n"
         "- ref_text: 1-2 representative spoken sentences from the character, or the best available sample line.\n\n"
-        f"Character reference:\n{_json_preview(compact)}"
+        f"Character reference:\n{_json_preview(compact)}",
+        lang_ctx,
     )
 
 
@@ -522,7 +527,7 @@ def _save_generated_preview(root, engine, voice_config, speaker, description, re
         return False
 
 
-def run_advanced_persona_generation(script, selected_speakers, samples, voice_config, client, model_name, engine, root, args, system_prompt=None, advanced_prompt=None):
+def run_advanced_persona_generation(script, selected_speakers, samples, voice_config, client, model_name, engine, root, args, system_prompt=None, advanced_prompt=None, lang_ctx=None):
     ref_dir = os.path.join(root, "persona_refs")
     os.makedirs(ref_dir, exist_ok=True)
 
@@ -598,8 +603,8 @@ def run_advanced_persona_generation(script, selected_speakers, samples, voice_co
             response = client.chat.completions.create(
                 model=model_name,
                 messages=[
-                    {"role": "system", "content": system_prompt or "You produce concise JSON only."},
-                    {"role": "user", "content": _compile_character_prompt(ref, advanced_prompt)}
+                    {"role": "system", "content": apply_language(system_prompt or "You produce concise JSON only.", lang_ctx)},
+                    {"role": "user", "content": _compile_character_prompt(ref, advanced_prompt, lang_ctx)}
                 ],
                 temperature=0.25,
                 max_tokens=600,
@@ -691,6 +696,12 @@ def main():
     persona_user = prompts_cfg.get("persona_user_prompt") or PERSONA_USER_PROMPT
     persona_advanced = prompts_cfg.get("persona_advanced_prompt") or PERSONA_ADVANCED_PROMPT
 
+    # Persona descriptions follow the TTS language so the Voices tab and the
+    # generated previews read in the same language as the book; ref_text stays a
+    # verbatim quote and is therefore exempt.
+    lang_ctx = description_language_context((config.get("tts", {}) or {}).get("language"))
+    persona_system = apply_language(persona_system, lang_ctx)
+
     # Load existing voice_config (preserve other fields)
     voice_config = {}
     if os.path.exists(voice_config_path):
@@ -731,6 +742,7 @@ def main():
             args=args,
             system_prompt=persona_system,
             advanced_prompt=persona_advanced,
+            lang_ctx=lang_ctx,
         )
         try:
             _atomic_json_write(voice_config, voice_config_path)
@@ -830,10 +842,12 @@ def main():
             intro_ctx = narrator_context.get(speaker, [])
             intro_blob = "\n".join(intro_ctx) if intro_ctx else "(No nearby narrator intro lines found.)"
 
-            user_prompt = persona_user.format(
+            user_prompt = safe_format(
+                persona_user,
+                lang_ctx,
                 speaker=speaker,
                 narrator_context=intro_blob,
-                sample_lines=sample_text
+                sample_lines=sample_text,
             )
 
             response = client.chat.completions.create(

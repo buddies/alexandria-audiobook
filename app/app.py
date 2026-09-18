@@ -28,6 +28,7 @@ from tts import sanitize_filename
 from default_prompts import load_default_prompts
 from review_prompts import load_review_prompts
 from persona_prompts import load_persona_prompts
+from character_style_prompts import load_character_style_prompts
 from hf_utils import fetch_builtin_manifest, download_builtin_adapter, is_adapter_downloaded
 
 # Setup logging
@@ -269,6 +270,12 @@ class GenerationConfig(BaseModel):
     merge_mid_sentence: bool = True  # keep a sentence split mid-way in one TTS take
     merge_same_speaker: bool = False  # merge any consecutive lines of the same speaker
     max_chunk_chars: int = 500  # upper bound on characters per TTS chunk
+    # Ask the LLM for a constant per-speaker voice anchor right after the script
+    # is written (fills only voices that have no Character Style yet).
+    auto_character_style: bool = True
+    # Speaker label used for narration in the generated script (its voice name).
+    # Empty = derive it from tts.language, e.g. "旁白" for Chinese.
+    narrator_label: str = ""
 
 class PromptConfig(BaseModel):
     system_prompt: Optional[str] = None
@@ -278,6 +285,8 @@ class PromptConfig(BaseModel):
     persona_system_prompt: Optional[str] = None
     persona_user_prompt: Optional[str] = None
     persona_advanced_prompt: Optional[str] = None
+    character_style_system_prompt: Optional[str] = None
+    character_style_user_prompt: Optional[str] = None
 
 class AppConfig(BaseModel):
     llm: LLMConfig
@@ -411,6 +420,7 @@ class BatchPreparerRequest(BaseModel):
 # Global state for process tracking
 process_state = {
     "script": {"running": False, "logs": []},
+    "character_styles": {"running": False, "logs": []},
     "persona": {"running": False, "logs": [], "cancel": False, "process": None},
     "audio": {"running": False, "logs": [], "cancel": False},
     "audacity_export": {"running": False, "logs": []},
@@ -502,6 +512,81 @@ def _stream_subprocess_to_logs(command: List[str], cwd: str, state: dict, log_pr
     reader.join()
     process.wait()
     return process.returncode
+
+
+def _auto_character_style_enabled() -> bool:
+    """Read `generation.auto_character_style` (default: on) from config.json."""
+    if not os.path.exists(CONFIG_PATH):
+        return True
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return bool(json.load(f).get("generation", {}).get("auto_character_style", True))
+    except (json.JSONDecodeError, ValueError, TypeError, OSError):
+        return True
+
+
+def _run_script_then_character_styles(command: List[str], auto_styles: bool):
+    """Run script generation, then the character-style pass, into the same log.
+
+    Both steps stream into process_state['script'] so the Generation Logs panel
+    shows one continuous story. A failure in the second step is reported but not
+    fatal: the script itself is already written and usable.
+    """
+    state = process_state["script"]
+    state["running"] = True
+    state["logs"] = []
+    logger.info(f"Starting task script: {' '.join(command)}")
+
+    try:
+        return_code = _stream_subprocess_to_logs(command, BASE_DIR, state)
+        if return_code != 0:
+            state["logs"].append(f"Task script failed with return code {return_code}.")
+            return
+        state["logs"].append("Task script completed successfully.")
+
+        if not auto_styles:
+            return
+
+        state["logs"].append(
+            "[character styles] Deriving a constant voice anchor for every speaker..."
+        )
+        style_code = _stream_subprocess_to_logs(
+            [sys.executable, "-u", "generate_character_styles.py"], BASE_DIR, state
+        )
+        if style_code == 0:
+            state["logs"].append(
+                "[character styles] Done. Review the Character Style fields in the Voices tab."
+            )
+        else:
+            state["logs"].append(
+                f"[character styles] Step failed (exit {style_code}); the script is unaffected. "
+                f"Re-run it from the Voices tab if you want the anchors."
+            )
+    except Exception as e:
+        logger.error(f"Error running script task: {e}")
+        state["logs"].append(f"Error: {str(e)}")
+    finally:
+        state["running"] = False
+
+
+def _run_character_styles(command: List[str]):
+    """Run the character-style pass on its own, into its own log stream."""
+    state = process_state["character_styles"]
+    state["running"] = True
+    state["logs"] = []
+    logger.info(f"Starting task character_styles: {' '.join(command)}")
+
+    try:
+        return_code = _stream_subprocess_to_logs(command, BASE_DIR, state)
+        if return_code == 0:
+            state["logs"].append("Task character_styles completed successfully.")
+        else:
+            state["logs"].append(f"Task character_styles failed with return code {return_code}.")
+    except Exception as e:
+        logger.error(f"Error running character_styles: {e}")
+        state["logs"].append(f"Error: {str(e)}")
+    finally:
+        state["running"] = False
 
 
 # Endpoints
@@ -608,6 +693,15 @@ async def get_config():
             except RuntimeError:
                 pass
 
+    # Character-style prompts always have a built-in fallback, so this loader
+    # cannot fail and fills them in last, after the file-based prompts above.
+    cs_sys, cs_usr = load_character_style_prompts()
+    prompts = config.setdefault("prompts", {})
+    if not prompts.get("character_style_system_prompt"):
+        prompts["character_style_system_prompt"] = cs_sys
+    if not prompts.get("character_style_user_prompt"):
+        prompts["character_style_user_prompt"] = cs_usr
+
     # Include current input file info if available
     state_path = os.path.join(ROOT_DIR, "state.json")
     if os.path.exists(state_path):
@@ -642,6 +736,9 @@ async def get_default_prompts():
         result["persona_advanced_prompt"] = persona_adv
     except RuntimeError:
         pass
+    cs_sys, cs_usr = load_character_style_prompts()
+    result["character_style_system_prompt"] = cs_sys
+    result["character_style_user_prompt"] = cs_usr
     return result
 
 @app.post("/api/config")
@@ -816,7 +913,9 @@ async def generate_script(background_tasks: BackgroundTasks, request: GenerateSc
             "--speaker-name", request.speaker_name or "Narrator",
             "--instruct", request.instruct or "Neutral narration.",
         ]
-    background_tasks.add_task(run_process, cmd, "script")
+    background_tasks.add_task(
+        _run_script_then_character_styles, cmd, _auto_character_style_enabled()
+    )
     return {"status": "started"}
 
 @app.post("/api/review_script")
@@ -955,6 +1054,39 @@ async def generate_personas(background_tasks: BackgroundTasks, request: Generate
         command.extend(["--advanced", "--batch-size", str(batch_size)])
     background_tasks.add_task(run_process, command, "persona")
     return {"status": "started", "advanced": request.advanced}
+
+
+class CharacterStyleRequest(BaseModel):
+    overwrite: bool = False  # default: only voices with an empty Character Style are filled
+    speakers: str = ""       # optional comma-separated allowlist
+
+
+@app.post("/api/generate_character_styles")
+async def generate_character_styles_endpoint(
+        background_tasks: BackgroundTasks,
+        request: CharacterStyleRequest = CharacterStyleRequest()):
+    """Derive a constant character_style anchor per speaker from the script.
+
+    Runs `app/generate_character_styles.py`, which reads `annotated_script.json`,
+    asks the LLM for one acoustic identity anchor per speaker and stores it in
+    `voice_config.json` (existing anchors are preserved unless `overwrite`).
+
+    This also runs automatically at the end of `/api/generate_script` while
+    `generation.auto_character_style` is enabled.
+    """
+    if process_state["character_styles"]["running"]:
+        raise HTTPException(status_code=400, detail="Character style generation already running")
+
+    if not os.path.exists(SCRIPT_PATH):
+        raise HTTPException(status_code=400, detail="No annotated script found. Generate a script first.")
+
+    command = [sys.executable, "-u", "generate_character_styles.py"]
+    if request.overwrite:
+        command.append("--overwrite")
+    if request.speakers.strip():
+        command.extend(["--speakers", request.speakers.strip()])
+    background_tasks.add_task(_run_character_styles, command)
+    return {"status": "started", "overwrite": request.overwrite}
 
 
 @app.post("/api/cancel_persona")

@@ -184,9 +184,12 @@ Web UI 显示的是高层状态，**详细日志在 Pinokio 终端中**：
 脚本中检测到的每个角色都会有一张声音卡片。为每个说话人：
 - 选择声音类型：Custom Voice（最简单）、Clone Voice、LoRA Voice 或 Voice Design
 - 使用 Custom Voice 时，从 9 个预设中选择（Ryan、Serena、Aiden 等），可选设置角色风格（例如"沉稳的旁白语调"）
-- **Seed（Custom Voice）** — 每张声音卡片都有 Seed 字段，用于固定角色音色：相同 seed + 相同预设每次都会生成完全一致的音色，角色不会在段落之间变成另一个人的声音。留空（或 `-1`）使用默认的按角色名固定种子；填入数字即可锁定当前满意的音色，或点击骰子按钮换一个 seed 后重新生成某句试听。优先级为：角色固定 seed → Batch Seed（Setup 页，仅 Fast batch 生效）→ 按角色名的稳定种子 → 随机；Editor、批量渲染与试听完全一致地遵循该优先级
+- **Seed（Custom Voice）** — 每张声音卡片都有 Seed 字段，用于固定角色音色。注意：**同一个 seed 只有在预设与 instruct 都相同时才逐字节一致**；只要那一行的 instruct 变了，就等于重新掷了一次音色（验证见下方“角色风格”）。留空（或 `-1`）使用默认的按角色名固定种子；填入数字即可锁定当前满意的音色，或点击骰子按钮换一个 seed 后重新生成某句试听。优先级为：角色固定 seed → Batch Seed（Setup 页，仅 Fast batch 生效）→ 按角色名的稳定种子 → 随机；Editor、批量渲染与试听完全一致地遵循该优先级
 - **试听（Preview）** — 每张卡片的 Preview 按钮会用该卡当前设置（预设、角色风格、seed）生成一句短台词并就地播放，方便在正式渲染前确认音色、挑好固定的 seed。试听台词可在卡片上方的 "Preview line" 中统一填写，留空则使用与 TTS 语言对应的默认台词
 - **生成角色** — 点击后 LLM 分析脚本，为每个角色创建声音描述、生成参考音频并自动分配克隆声音。切换"Advanced"可控制批量大小。这是为所有角色分配独特声音的最快方式
+- **角色风格（音色锚点）** — 每张声音卡片的 Character Style 字段会被追加到该角色每一行的 instruct 之后，是整条指令里唯一描述"这个人本身"而非"这一句的情绪"的部分。只用声学描述（声音类型、音区、音色、质感、基准语速），不要写情绪或表演词：TTS 会用整条 instruct 重新生成声音，情绪化锚点会直接改变音色
+- **自动生成角色风格** — Setup → Generation Settings 里的 **Auto-generate Character Styles** 默认开启。生成脚本后会顺带让 LLM 为每个角色写一条锚点并写入 `voice_config.json`；**已经填写的 Character Style 不会被覆盖**。也可在声音标签页点 **Generate Character Styles** 手动触发，或用 `python app/generate_character_styles.py --overwrite` 强制重写
+- **效果边界** — 恒定锚点能明显稳定频谱包络与平均音色，但无法单独消除逐行的"重掷"：固定的 seed 只锁定采样噪声，不锁定音色。旁白这类需要整本书一致的音色，建议同时把 **Emotion Direction Per Line** 设为 `Voice style only`，让下发的指令恒定，从而逐字节可复现
 - **说话人别名** — 使用声音卡片上的"Alias of"下拉菜单将一个说话人映射到另一个角色的声音（例如将"年轻的艾琳娜"设为"艾琳娜"的别名）
 - 更改自动保存 — 各类型详细说明参见 [Voice Types](https://github.com/Finrandojin/alexandria-audiobook/wiki/Voice-Types)
 
@@ -257,7 +260,12 @@ Conda 自带的 ffmpeg 在 Windows 上通常缺少 MP3 编码器（libmp3lame）
 ### 中文书籍处理提示
 - 在设置标签页的 **Language** 下拉菜单中选择"Chinese"或"Auto"
 - 默认 LLM 提示是为英文编写的 — 处理中文书籍时，建议在设置标签页的"Prompt Customization"部分修改提示，使其适配中文对话约定（如使用「」引号等）
-- 提示文件 `default_prompts.txt` 和 `review_prompts.txt` 可永久修改，更改即时生效无需重启
+- **输出语言（TTS Language）** — 设置标签页的 **Language** 下拉不只决定合成语言，也决定**生成脚本**的语言：说话人名称就是 Voices 页的 voice 名称（也是 `voice_config.json` 的键），每行的 **Emotion / Style** 就是逐行 instruct，两者都按该语言生成——中文书 + Chinese 会得到 `旁白` / `陈继风`，而不是 `NARRATOR` / `CHEN JIFENG`，情绪描述也是中文
+- 实现上会在你当前使用的生成提示（内置或自定义）后面追加一段"输出语言"规则块并声明其优先级高于前文，因此自定义提示里写的"名称用大写英文"不会再与设置冲突；该规则块同时声明 `text` 字段绝不翻译
+- 旁白标签按语言本地化（中文 `旁白`、日文 `ナレーター`、英文 `NARRATOR`），可在 Setup → Generation Settings 的 **Narrator Label** 中覆盖。注意所有旁白行必须使用完全相同的字符串，否则每个不同写法都会变成一个独立 voice
+- 脚本复审、角色（Persona）生成、Character Style 生成都共用同一设置，因此复审不会把你的中文标签"修正"回英文
+- 把 Language 设为 **Auto** 则不强制语言，完全交给原文与你的提示
+- 提示文件 `default_prompts.txt`、`review_prompts.txt`、`persona_prompts.txt`、`character_style_prompts.txt` 可永久修改，更改即时生效无需重启
 
 ---
 

@@ -166,7 +166,7 @@
                                     <option value="Russian">Russian</option>
                                     <option value="Spanish">Spanish</option>
                                 </select>
-                                <div class="form-text">Language for audio synthesis only. To generate scripts in another language, edit the prompts under Prompt Settings (Advanced).</div>
+                                <div class="form-text">Language for synthesis <em>and</em> for the generated script: speaker labels (the voice names) and each line's Emotion / Style direction are written in this language. "Auto" leaves both to the source text and your prompts.</div>
                             </div>
                             <div class="col-md-2">
                                 <label class="form-label">Parallel Workers</label>
@@ -345,6 +345,16 @@
                                     <input type="number" class="form-control" id="max-chunk-chars" value="500" min="80" step="20">
                                     <div class="form-text">Upper bound on characters per TTS chunk. Larger = fewer independent takes = more consistent voice, slightly longer requests. Applies when chunks are (re)built from the script.</div>
                                 </div>
+                                <div class="col-md-6">
+                                    <label class="form-label">Narrator Label</label>
+                                    <input type="text" class="form-control" id="narrator-label" placeholder="Auto from TTS Language (e.g. 旁白)">
+                                    <div class="form-text">The one speaker label used for narration in the generated script — it becomes the narrator's voice name, so every narration line must use this exact string. Empty = derive it from the TTS Language.</div>
+                                </div>
+                            </div>
+                            <div class="mb-3 form-check form-switch">
+                                <input class="form-check-input" type="checkbox" id="auto-character-style" checked>
+                                <label class="form-check-label" for="auto-character-style">Auto-generate Character Styles</label>
+                                <div class="form-text">After the script is generated, ask the LLM for one constant voice anchor per speaker and store it as that voice's Character Style. Only voices with an empty Character Style are filled in, so hand-tuned values are never overwritten. The same pass is available on demand in the Voices tab.</div>
                             </div>
                             <hr>
                             <h6 class="mb-3">Prompt Customization</h6>
@@ -386,6 +396,18 @@
                                 <label class="form-label">Persona Advanced Compilation Prompt</label>
                                 <textarea class="form-control font-monospace" id="persona-advanced-prompt" rows="8" style="font-size: 0.85em;"></textarea>
                                 <div class="form-text">Template for advanced mode final compilation. Use <code>{character_ref}</code> for the accumulated character reference data.</div>
+                            </div>
+                            <hr>
+                            <h6 class="mb-3">Character Style Prompt Customization</h6>
+                            <div class="mb-3">
+                                <label class="form-label">Character Style System Prompt</label>
+                                <textarea class="form-control font-monospace" id="character-style-system-prompt" rows="10" style="font-size: 0.85em;"></textarea>
+                                <div class="form-text">Instructions for the LLM that writes each voice's constant <code>character_style</code> anchor. Keep it describing acoustics only — the per-line instruct is what carries emotion.</div>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">Character Style User Prompt Template</label>
+                                <textarea class="form-control font-monospace" id="character-style-user-prompt" rows="6" style="font-size: 0.85em;"></textarea>
+                                <div class="form-text">Template for each batch of speakers. Use <code>{language}</code> for the requested output language and <code>{characters}</code> for the per-speaker samples.</div>
                             </div>
                             <button type="button" class="btn btn-outline-secondary btn-sm mb-3" onclick="resetPrompts()">
                                 <i class="fas fa-undo me-1"></i>Reset to Defaults
@@ -497,6 +519,11 @@
                         </div>
                         <button class="btn btn-outline-danger" id="btn-cancel-personas" onclick="cancelPersonas()" style="display:none;"><i class="fas fa-stop me-1"></i>Cancel</button>
                         <span id="persona-status" class="text-muted small"></span>
+                    </div>
+                    <div class="d-flex align-items-center gap-3 mb-2 flex-wrap">
+                        <button class="btn btn-outline-primary" id="btn-gen-character-styles" onclick="generateCharacterStyles()"><i class="fas fa-wand-magic-sparkles me-1"></i>Generate Character Styles</button>
+                        <span id="character-style-status" class="text-muted small"></span>
+                        <div class="form-text m-0">One constant voice anchor per speaker, written to each voice card's Character Style field. Voices that already have one are left alone.</div>
                     </div>
                     <div class="d-flex align-items-center gap-2 mb-2 flex-wrap">
                         <div class="input-group input-group-sm" style="max-width: 520px;">
@@ -1336,11 +1363,18 @@
                     if (config.prompts.persona_advanced_prompt) {
                         document.getElementById('persona-advanced-prompt').value = config.prompts.persona_advanced_prompt;
                     }
+                    if (config.prompts.character_style_system_prompt) {
+                        document.getElementById('character-style-system-prompt').value = config.prompts.character_style_system_prompt;
+                    }
+                    if (config.prompts.character_style_user_prompt) {
+                        document.getElementById('character-style-user-prompt').value = config.prompts.character_style_user_prompt;
+                    }
                 }
 
                 // If review/persona prompts are still empty, fetch defaults
                 if (!document.getElementById('review-system-prompt').value || !document.getElementById('review-user-prompt').value
-                    || !document.getElementById('persona-system-prompt').value || !document.getElementById('persona-user-prompt').value) {
+                    || !document.getElementById('persona-system-prompt').value || !document.getElementById('persona-user-prompt').value
+                    || !document.getElementById('character-style-system-prompt').value || !document.getElementById('character-style-user-prompt').value) {
                     try {
                         const defaults = await API.get('/api/default_prompts');
                         if (!document.getElementById('review-system-prompt').value && defaults.review_system_prompt) {
@@ -1357,6 +1391,12 @@
                         }
                         if (!document.getElementById('persona-advanced-prompt').value && defaults.persona_advanced_prompt) {
                             document.getElementById('persona-advanced-prompt').value = defaults.persona_advanced_prompt;
+                        }
+                        if (!document.getElementById('character-style-system-prompt').value && defaults.character_style_system_prompt) {
+                            document.getElementById('character-style-system-prompt').value = defaults.character_style_system_prompt;
+                        }
+                        if (!document.getElementById('character-style-user-prompt').value && defaults.character_style_user_prompt) {
+                            document.getElementById('character-style-user-prompt').value = defaults.character_style_user_prompt;
                         }
                     } catch (e) {
                         console.warn("Could not fetch default prompts", e);
@@ -1395,6 +1435,10 @@
                     if (config.generation.max_chunk_chars != null) {
                         document.getElementById('max-chunk-chars').value = config.generation.max_chunk_chars;
                     }
+                    document.getElementById('auto-character-style').checked = config.generation.auto_character_style !== false;
+                    if (config.generation.narrator_label != null) {
+                        document.getElementById('narrator-label').value = config.generation.narrator_label;
+                    }
                 }
 
                 // Show previously loaded file
@@ -1428,6 +1472,12 @@
                 if (defaults.persona_advanced_prompt) {
                     document.getElementById('persona-advanced-prompt').value = defaults.persona_advanced_prompt;
                 }
+                if (defaults.character_style_system_prompt) {
+                    document.getElementById('character-style-system-prompt').value = defaults.character_style_system_prompt;
+                }
+                if (defaults.character_style_user_prompt) {
+                    document.getElementById('character-style-user-prompt').value = defaults.character_style_user_prompt;
+                }
             } catch (e) {
                 console.error("Failed to fetch default prompts", e);
                 showToast("Failed to load default prompts from server.", 'error');
@@ -1444,6 +1494,8 @@
             document.getElementById('merge-mid-sentence').checked = true;
             document.getElementById('merge-same-speaker').checked = false;
             document.getElementById('max-chunk-chars').value = 500;
+            document.getElementById('auto-character-style').checked = true;
+            document.getElementById('narrator-label').value = '';
         };
 
         // Toggle chevron on collapse
@@ -1527,7 +1579,9 @@
                     review_user_prompt: document.getElementById('review-user-prompt').value,
                     persona_system_prompt: document.getElementById('persona-system-prompt').value,
                     persona_user_prompt: document.getElementById('persona-user-prompt').value,
-                    persona_advanced_prompt: document.getElementById('persona-advanced-prompt').value
+                    persona_advanced_prompt: document.getElementById('persona-advanced-prompt').value,
+                    character_style_system_prompt: document.getElementById('character-style-system-prompt').value,
+                    character_style_user_prompt: document.getElementById('character-style-user-prompt').value
                 },
                 generation: {
                     chunk_size: chunkSize,
@@ -1543,7 +1597,9 @@
                     merge_narrators: document.getElementById('merge-narrators').checked,
                     merge_mid_sentence: document.getElementById('merge-mid-sentence').checked,
                     merge_same_speaker: document.getElementById('merge-same-speaker').checked,
-                    max_chunk_chars: num('max-chunk-chars', 500, { integer: true, min: 80 })
+                    max_chunk_chars: num('max-chunk-chars', 500, { integer: true, min: 80 }),
+                    auto_character_style: document.getElementById('auto-character-style').checked,
+                    narrator_label: (document.getElementById('narrator-label').value || '').trim()
                 }
             };
             try {
@@ -1723,6 +1779,49 @@
             }, 1500);
         }
 
+        // --- Character Style Generation ---
+        async function generateCharacterStyles() {
+            const statusSpan = document.getElementById('character-style-status');
+            try {
+                if (statusSpan) {
+                    statusSpan.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Starting...';
+                }
+                await API.post('/api/generate_character_styles', { overwrite: false });
+                pollCharacterStyleStatus();
+            } catch (e) {
+                showToast('Failed to start character style generation: ' + e.message, 'error');
+                if (statusSpan) statusSpan.innerText = '';
+            }
+        }
+
+        async function pollCharacterStyleStatus() {
+            const logEl = document.getElementById('voices-logs');
+            const statusSpan = document.getElementById('character-style-status');
+            const interval = setInterval(async () => {
+                try {
+                    const status = await API.get('/api/status/character_styles');
+                    if (statusSpan) {
+                        statusSpan.innerText = status.running ? 'Generating...' : 'Finished';
+                    }
+                    if (logEl) {
+                        logEl.innerText = (status.logs || []).join('\n');
+                        logEl.scrollTop = logEl.scrollHeight;
+                    }
+
+                    if (!status.running) {
+                        clearInterval(interval);
+                        try { await loadVoices(); } catch (e) { /* ignore */ }
+                        showToast('Character styles updated', 'success');
+                        if (statusSpan) statusSpan.innerText = '';
+                    }
+                } catch (e) {
+                    clearInterval(interval);
+                    showToast('Character style status poll failed: ' + e.message, 'error');
+                    if (statusSpan) statusSpan.innerText = '';
+                }
+            }, 1500);
+        }
+
         // --- Voices Tab ---
         const AVAILABLE_VOICES = ["Aiden", "Dylan", "Eric", "Ono_anna", "Ryan", "Serena", "Sohee", "Uncle_fu", "Vivian"];
 
@@ -1794,7 +1893,7 @@
                                             </div>
                                         </div>
                                         <div class="col-md-7">
-                                            <div class="form-text m-0">Pins the voice identity: the same seed always renders the same timbre, so pick one that fits the character and keep it. Empty or -1 uses the default per-speaker seed.</div>
+                                            <div class="form-text m-0">Pins the voice take: the same seed reproduces byte-for-byte only while the instruct is also the same — change the instruct and the timbre is re-rolled. Empty or -1 uses the default per-speaker seed.</div>
                                         </div>
                                     </div>
                                 </div>

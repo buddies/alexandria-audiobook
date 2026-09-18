@@ -199,7 +199,7 @@ Configure your LLM connection and TTS engine. At minimum you need:
 Each character detected in the script gets a voice card. For each speaker:
 - Choose a voice type: Custom Voice (easiest), Clone Voice, LoRA Voice, or Voice Design
 - For Custom Voice, pick from 9 presets (Ryan, Serena, Aiden, etc.) and optionally set a character style (e.g., "Heavy Scottish accent")
-- **Seed (Custom Voice)** — every voice card has a Seed field that pins the voice identity: the same seed and preset always render the exact same timbre, so one character never drifts into a different-sounding person. Leave it empty (or `-1`) to use the default stable per-speaker seed; type a number to keep a take you liked, or click the dice to roll a new one and re-generate a line to audition it. Precedence is: pinned per-voice seed → Batch Seed (Setup tab, Fast batch only) → stable per-speaker seed → random, and it is applied identically by the Editor, the batch renderer, and Preview
+- **Seed (Custom Voice)** — every voice card has a Seed field that pins the voice identity. Note that a seed reproduces byte-for-byte only while the preset *and* the per-line instruct stay identical: a different instruct re-rolls the timbre even with the same seed (see **Character Styles** below). Leave it empty (or `-1`) to use the default stable per-speaker seed; type a number to keep a take you liked, or click the dice to roll a new one and re-generate a line to audition it. Precedence is: pinned per-voice seed → Batch Seed (Setup tab, Fast batch only) → stable per-speaker seed → random, and it is applied identically by the Editor, the batch renderer, and Preview
 - **Preview** — each card's Preview button renders one short line with that card's current settings (preset, character style, seed) and plays it inline, so a voice or a freshly rolled seed can be auditioned before rendering the book. Type the line once in the "Preview line" box above the cards; leave it empty to use a default line in the TTS language
 - **Generate Personas** — Click to have the LLM analyze the script, create voice descriptions for each character, generate reference audio, and assign clone voices automatically. Toggle "Advanced" for batch size control. This is the fastest way to assign unique voices to all characters
 - **Speaker Aliases** — Use the "Alias of" dropdown on any voice card to map a speaker to another character's voice (e.g., set "YOUNG ELENA" as alias of "ELENA"). Aliased speakers use the target's voice config during generation
@@ -317,6 +317,13 @@ Aliases resolve transitively (A → B → C uses C's config) with cycle detectio
 - Set a base voice description (e.g., "Young strong soldier")
 - Each line's instruct is appended as delivery/emotion direction
 - Generates voice on-the-fly using the VoiceDesign model — ideal for minor characters
+
+**Character Styles (the voice identity anchor):**
+- Every customization mode has a Character Style field. Whatever it holds is appended to each line's per-line instruct before the request is sent, so it is the one part of the instruction that describes *who the character is* rather than what they are feeling in that line
+- Write it as acoustics only — voice type, register, timbre, texture, baseline pace (e.g. "Male voice in his fifties, low baritone register, dry timbre, deliberate pace"). Never put emotion or delivery words there: the engine regenerates the voice from the whole instruction string, so an emotional anchor moves the timbre itself and you lose the per-line control you were paying for
+- With **Auto-generate Character Styles** enabled (Setup → Generation Settings), generating a script also asks the configured LLM for one anchor per speaker and writes it into `voice_config.json`. Voices that already have a Character Style are left untouched, so hand-tuned values survive
+- Run it on demand from the Voices tab (**Generate Character Styles**), or force a rewrite with `python app/generate_character_styles.py --overwrite [--speakers NARRATOR,ELENA]`
+- Honest scope: a constant anchor measurably stabilises the spectral envelope and the average voice, but it cannot cancel the per-line re-roll on its own — a pinned seed only fixes the sampling noise, not the timbre. For a book-wide narrator, pair it with **Emotion Direction Per Line → Voice style only**, which makes the payload instruction constant and therefore byte-reproducible
 
 ### Voice Designer Tab
 Create new voices from text descriptions without needing reference audio.
@@ -925,6 +932,8 @@ LLM prompts are stored in plain-text files at the project root, split into syste
 
 - **`default_prompts.txt`** — Prompts for script generation (annotation)
 - **`review_prompts.txt`** — Prompts for script review (error correction)
+- **`persona_prompts.txt`** — Prompts for persona generation (description + reference text)
+- **`character_style_prompts.txt`** — Prompts for the per-speaker Character Style anchors (`system ---SEPARATOR--- user`). Missing or malformed content falls back to the copy embedded in `app/character_style_prompts.py`, because this pass runs automatically at the end of script generation and must never throw away a finished script
 
 **How it works:**
 - `app/default_prompts.py` and `app/review_prompts.py` read their respective files and export the prompts
@@ -936,7 +945,13 @@ LLM prompts are stored in plain-text files at the project root, split into syste
 1. **Temporary (per-session):** Edit generation prompts directly in the Setup tab's Prompt Customization section
 2. **Permanent (all sessions):** Edit `default_prompts.txt` or `review_prompts.txt` directly — changes are picked up on the next request
 
-**Non-English books:** The default LLM prompts are written for English text and reference English-specific conventions (attribution tags like "said he", quotation marks, etc.). When processing books in other languages, you'll get better results by editing the prompts to match that language's dialogue conventions — for example, French guillemets (« »), Japanese brackets (「」), or language-appropriate attribution patterns. Set the TTS **Language** dropdown to match as well.
+**Output language (TTS Language):** the TTS **Language** dropdown also decides the language of the *generated script*, not just the audio. Speaker labels become the voice names on the Voices tab and the keys of `voice_config.json`, and each line's **Emotion / Style** direction is the per-line instruct, so both are written in that language — a Chinese book read by a Chinese voice comes back with `旁白` / `陈继风` instead of `NARRATOR` / `CHEN JIFENG`, and Chinese emotion directions. Three things make that work:
+
+- A language rule block is appended to whichever generation prompt is in play (shipped or hand-written) and takes precedence over it, so a custom prompt that says "UPPERCASE names" no longer fights the setting. It also states that the `text` field must never be translated
+- The narrator label is localised (`旁白` for Chinese, `ナレーター` for Japanese, `NARRATOR` for English) and can be overridden with the **Narrator Label** field in Setup → Generation Settings. Every narration line must use that exact string, because each distinct label would become a separate voice
+- The script review pass, persona generation and Character Style generation all use the same setting, so a review pass can no longer "correct" your Chinese labels back into English
+
+**Non-English books:** The default LLM prompts are written for English text and reference English-specific conventions (attribution tags like "said he", quotation marks, etc.). When processing books in other languages, you'll get better results by editing the prompts to match that language's dialogue conventions — for example, French guillemets (« »), Japanese brackets (「」), or language-appropriate attribution patterns. Set the TTS **Language** dropdown to match as well — that is what makes the labels and directions come out in the right language. Set it to **Auto** to leave the language entirely to the source text and your prompts.
 
 ## Project Structure
 
@@ -948,6 +963,8 @@ Alexandria/
 │   ├── train_lora.py          # LoRA training subprocess script
 │   ├── generate_script.py     # LLM script annotation
 │   ├── generate_personas.py   # LLM persona generation + VoiceDesign voice assignment
+│   ├── generate_character_styles.py  # LLM per-speaker Character Style anchors
+│   ├── character_style_prompts.py    # Character Style prompt loader (reads character_style_prompts.txt)
 │   ├── review_script.py       # LLM script review (second pass)
 │   ├── utils.py               # Shared utilities (atomic JSON writes)
 │   ├── default_prompts.py     # Generation prompt loader (reads default_prompts.txt)
@@ -964,6 +981,7 @@ Alexandria/
 ├── lora_models/               # Trained LoRA adapters (gitignored)
 ├── default_prompts.txt        # LLM prompts for script generation
 ├── review_prompts.txt         # LLM prompts for script review
+├── character_style_prompts.txt # LLM prompts for Character Style anchors
 ├── install.js                 # Pinokio installer
 ├── start.js                   # Pinokio launcher
 ├── reset.js                   # Reset script

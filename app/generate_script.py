@@ -5,6 +5,13 @@ import re
 import argparse
 from openai import OpenAI
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
+from script_language import (
+    apply_language,
+    default_instruct_for,
+    is_narrator_label,
+    language_context,
+    safe_format,
+)
 from llm_utils import (
     analyze_response,
     next_max_tokens,
@@ -232,10 +239,11 @@ def split_into_chunks(text, max_size=3000):
 
     return chunks
 
-def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_entries=None, max_retries=2, system_prompt=None, user_prompt_template=None, max_tokens=4096, temperature=0.6, top_p=0.8, top_k=0, min_p=0, presence_penalty=0.0, banned_tokens=None):
+def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_entries=None, max_retries=2, system_prompt=None, user_prompt_template=None, max_tokens=4096, temperature=0.6, top_p=0.8, top_k=0, min_p=0, presence_penalty=0.0, banned_tokens=None, lang_ctx=None):
     """Process a text chunk and return JSON script entries"""
     # Use provided prompts or fall back to defaults
-    sys_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
+    lang_ctx = lang_ctx or language_context("")
+    sys_prompt = apply_language(system_prompt or DEFAULT_SYSTEM_PROMPT, lang_ctx)
     usr_template = user_prompt_template or DEFAULT_USER_PROMPT
 
     context_parts = []
@@ -250,8 +258,8 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
     if previous_entries and len(previous_entries) > 0:
         # Build character roster for name consistency across chunks
         characters_seen = sorted(set(
-            entry.get("speaker", "") for entry in previous_entries
-            if entry.get("speaker", "") and entry.get("speaker", "") != "NARRATOR"
+            speaker for speaker in (entry.get("speaker", "") for entry in previous_entries)
+            if speaker and not is_narrator_label(speaker)
         ))
         if characters_seen:
             context_parts.append(f"Characters in this book: {', '.join(characters_seen)}")
@@ -263,7 +271,7 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
             context_parts.append(json.dumps(entry, ensure_ascii=False))
 
     context = "\n".join(context_parts)
-    user_prompt = usr_template.format(context=context, chunk=chunk)
+    user_prompt = safe_format(usr_template, lang_ctx, context=context, chunk=chunk)
 
     # Output budget for this chunk. Thinking output is charged against it, so a
     # truncated reply is retried with a bigger budget instead of being accepted.
@@ -426,6 +434,14 @@ def run_single_speaker(book_content, speaker_name, instruct):
     _write_script_output(entries)
 
 
+def _language_context_from(config):
+    """Language rules for this run: `tts.language` plus an optional label override."""
+    tts_config = config.get("tts", {}) or {}
+    generation_config = config.get("generation", {}) or {}
+    return language_context(tts_config.get("language"),
+                            generation_config.get("narrator_label", ""))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate annotated audiobook script.")
     parser.add_argument("input_file_path", help="Path to the input text/markdown/EPUB text file.")
@@ -452,12 +468,8 @@ def main():
 
     print(f"Read {len(book_content)} characters")
 
-    if args.single_speaker:
-        print(f"Single-speaker mode: attributing all narration to '{args.speaker_name}'")
-        run_single_speaker(book_content, args.speaker_name, args.instruct)
-        return
-
-    # Load LLM config
+    # Load config before the single-speaker shortcut: the language it carries
+    # decides how speaker labels and per-line directions are written.
     config_path = os.path.join(os.path.dirname(__file__), "config.json")
     config = {}
     if os.path.exists(config_path):
@@ -468,6 +480,23 @@ def main():
             print(f"Warning: Failed to load config.json: {e}")
     else:
         print("Warning: config.json not found. Using defaults.")
+
+    lang_ctx = _language_context_from(config)
+    print(f"Script output language: {lang_ctx['display_language']} "
+          f"(narrator label: {lang_ctx['narrator_label']})")
+
+    if args.single_speaker:
+        speaker_name = args.speaker_name.strip()
+        if speaker_name.lower() in ("", "narrator"):
+            # The UI sends its English default unless the user typed something;
+            # use the language's narrator label instead so the voice name matches.
+            speaker_name = lang_ctx["narrator_label"]
+        instruct = args.instruct.strip()
+        if instruct.lower() in ("", "neutral narration.", "neutral narration"):
+            instruct = default_instruct_for(lang_ctx["language"])
+        print(f"Single-speaker mode: attributing all narration to '{speaker_name}'")
+        run_single_speaker(book_content, speaker_name, instruct)
+        return
 
     llm_config = config.get("llm", {})
     base_url = llm_config.get("base_url", "http://localhost:11434/v1")
@@ -524,7 +553,8 @@ def main():
             top_k=top_k,
             min_p=min_p,
             presence_penalty=presence_penalty,
-            banned_tokens=banned_tokens
+            banned_tokens=banned_tokens,
+            lang_ctx=lang_ctx,
         )
         all_entries.extend(entries)
         print(f"  Got {len(entries)} entries")
