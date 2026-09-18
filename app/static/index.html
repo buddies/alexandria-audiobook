@@ -526,12 +526,17 @@
                         <div class="form-text m-0">One constant voice anchor per speaker, written to each voice card's Character Style field. Voices that already have one are left alone.</div>
                     </div>
                     <div class="d-flex align-items-center gap-2 mb-2 flex-wrap">
-                        <div class="input-group input-group-sm" style="max-width: 520px;">
+                        <div class="input-group input-group-sm" style="max-width: 400px;">
                             <span class="input-group-text">Preview line</span>
                             <input type="text" class="form-control" id="voice-preview-text" placeholder="Empty = a default line in the TTS language">
                         </div>
+                        <div class="input-group input-group-sm" style="max-width: 400px;">
+                            <span class="input-group-text">情绪 / 风格</span>
+                            <input type="text" class="form-control" id="voice-preview-instruct" placeholder="Empty = character style only">
+                        </div>
                         <span id="voice-preview-status" class="text-muted small"></span>
                     </div>
+                    <div class="form-text mb-2">Emotion / Style for this preview only. It is combined with the card's Character Style exactly the way a real line is, so you hear the payload a render would send. Leave it empty to audition the character style on its own.</div>
                     <div id="voices-list"></div>
                 </div>
             </div>
@@ -1839,6 +1844,7 @@
                                     <button class="btn btn-sm btn-outline-secondary voice-preview-btn" onclick="previewVoice(this)" title="Generate and play a short sample with the current settings"><i class="fas fa-play me-1"></i>Preview</button>
                                 </div>
                                 <div class="voice-preview-audio mt-1"></div>
+                                <div class="voice-preview-instruct form-text small text-muted mt-1"></div>
                                 <div class="form-text small text-muted mt-1">Alias of:</div>
                                 <select class="form-select form-select-sm alias-select mt-1">
                                     <option value="">-- None --</option>
@@ -2115,21 +2121,36 @@
             const speaker = card.dataset.voice;
             const statusEl = document.getElementById('voice-preview-status');
             const audioSlot = card.querySelector('.voice-preview-audio');
+            const instructSlot = card.querySelector('.voice-preview-instruct');
             const text = (document.getElementById('voice-preview-text')?.value || '').trim();
+            const instruct = (document.getElementById('voice-preview-instruct')?.value || '').trim();
             const icon = btn.querySelector('i');
             const prevIcon = icon ? icon.className : '';
 
             btn.disabled = true;
             if (icon) icon.className = 'fas fa-spinner fa-spin';
             if (statusEl) statusEl.innerHTML = `<i class="fas fa-spinner fa-spin me-1"></i>Generating preview for ${escapeHtml(speaker)}...`;
+            if (instructSlot) instructSlot.innerText = '';
             try {
                 const result = await API.post('/api/voice_preview', {
                     speaker,
                     config: collectCardConfig(card),
                     text,
+                    instruct,
                 });
                 if (audioSlot) {
                     audioSlot.innerHTML = `<audio controls autoplay src="${result.audio_url}" style="height:32px;max-width:100%;"></audio>`;
+                }
+                // Show what was actually sent, so the anchor can be verified by ear
+                // against a known payload rather than guessed from the card.
+                if (instructSlot) {
+                    const sent = (result.instructions || '').trim();
+                    const type = result.voice_type || 'custom';
+                    instructSlot.innerText = sent
+                        ? `Sends: ${sent}`
+                        : (type === 'clone'
+                            ? 'Sends: no instructions — cloned voices ignore the Character Style'
+                            : 'Sends: no instructions — this card has no Character Style set');
                 }
                 if (statusEl) statusEl.innerText = `Preview ready: ${speaker}`;
             } catch (e) {
@@ -2302,10 +2323,17 @@
                                     tbody.children.length === chunks.length;
 
                 if (canIncrement) {
-                    // Incremental update - only update changed rows
+                    // Incremental update - only update changed rows. The DOM badge
+                    // is compared too: if a row was left showing something else
+                    // (optimistic update, missed poll) it gets corrected here
+                    // instead of staying wrong until a full redraw.
                     chunks.forEach((chunk, i) => {
                         const cached = cachedChunks[i];
-                        if (!cached || cached.status !== chunk.status || cached.audio_path !== chunk.audio_path) {
+                        const domStatus = document.querySelector(`tr[data-id="${chunk.id}"] .badge`);
+                        const domText = domStatus ? domStatus.innerText.trim() : '';
+                        if (!cached || cached.status !== chunk.status ||
+                            cached.audio_path !== chunk.audio_path ||
+                            (domText && domText !== chunk.status)) {
                             updateChunkRow(chunk);
                         }
                     });
@@ -2354,8 +2382,9 @@
 
                 cachedChunks = chunks;
 
-                // If any chunk is generating, poll (without full redraw)
-                if (chunks.some(c => c.status === 'generating')) {
+                // If any chunk is generating, poll (without full redraw) — unless
+                // the render watcher is already driving the refresh cycle.
+                if (!_renderTimer && _renderTargets.size === 0 && chunks.some(c => c.status === 'generating')) {
                     setTimeout(() => loadChunks(false), 2000);
                 }
 
@@ -2644,13 +2673,91 @@
 
                 await API.post(`/api/chunks/${id}/generate`, {});
 
-                // Start polling with incremental updates (no full redraw)
-                setTimeout(() => loadChunks(false), 1000);
+                // Keep refreshing until this chunk is actually done/error.
+                watchRender([id]);
             } catch (e) {
                 showToast("Failed to start generation: " + e.message, 'error');
                 loadChunks(true); // Revert UI with full redraw
             }
         };
+
+        // ── Render watching ────────────────────────────────────────────
+        // The old loops stopped as soon as one poll found no chunk in the
+        // 'generating' state. The server only flips a chunk to 'generating' when
+        // its worker starts — which happens after the HTTP response — so that
+        // first poll could legitimately see everything 'pending', the loop would
+        // end, and the Editor would never refresh the row again. Watch until the
+        // requested chunks actually reach a terminal state instead.
+        let _renderTargets = new Set();
+        let _renderTimer = null;
+        let _renderStartedAt = 0;
+        let _renderOnFinish = null;
+
+        function stopRenderWatch() {
+            if (_renderTimer) { clearTimeout(_renderTimer); _renderTimer = null; }
+            _renderTargets = new Set();
+            _renderOnFinish = null;
+            document.querySelectorAll('tr.table-info').forEach(r => r.classList.remove('table-info'));
+        }
+
+        function finishRenderWatch() {
+            const done = _renderOnFinish;
+            stopRenderWatch();
+            cancelRender(true);   // restore the buttons and the isRenderingAll flag
+            if (done) { try { done(); } catch (e) { console.error('Render finish handler failed', e); } }
+        }
+
+        function watchRender(ids, onFinish = null) {
+            ids.forEach(id => _renderTargets.add(id));
+            if (onFinish) _renderOnFinish = onFinish;
+            if (_renderTimer) return;   // one shared loop for all watchers
+
+            _renderStartedAt = Date.now();
+            let lastProgress = Date.now();
+            let seenActivity = false;
+            const NEVER_STARTED_MS = 60000;        // no chunk ever reported 'generating'
+            const STALLED_MS = 5 * 60 * 1000;      // stopped reporting progress
+
+            const tick = async () => {
+                _renderTimer = null;
+                if (_renderTargets.size === 0) return;
+                try {
+                    await loadChunks(false);
+                } catch (e) {
+                    console.error('Render watch: refresh failed', e);
+                }
+
+                const watched = (cachedChunks || []).filter(c => _renderTargets.has(c.id));
+                if (watched.length === 0) {
+                    finishRenderWatch();   // every target vanished (list rebuilt / chunk deleted)
+                    return;
+                }
+                if (watched.every(c => c.status === 'done' || c.status === 'error')) {
+                    finishRenderWatch();
+                    return;
+                }
+                if (watched.some(c => c.status === 'generating')) {
+                    seenActivity = true;
+                    lastProgress = Date.now();
+                }
+
+                const idle = Date.now() - lastProgress;
+                if (idle > (seenActivity ? STALLED_MS : NEVER_STARTED_MS)) {
+                    // Nothing is moving. Only give up when the server agrees the
+                    // task is not running — a failed poll says nothing at all.
+                    let running = null;
+                    try { running = !!(await API.get('/api/status/audio')).running; } catch (e) { }
+                    if (running === false) { finishRenderWatch(); return; }
+                    lastProgress = Date.now();   // still running: keep waiting
+                }
+                if (Date.now() - _renderStartedAt > 6 * 60 * 60 * 1000) {
+                    finishRenderWatch();         // safety valve
+                    return;
+                }
+                _renderTimer = setTimeout(tick, 1500);
+            };
+            _renderTimer = setTimeout(tick, 1000);
+        }
 
         window.cancelRender = async (skipApi = false) => {
             isRenderingAll = false;
@@ -2658,10 +2765,13 @@
             document.getElementById('btn-regen-all').style.display = 'inline-block';
             document.getElementById('btn-cancel-render').style.display = 'none';
             if (!skipApi) {
+                stopRenderWatch();
                 try {
                     await API.post('/api/cancel_audio', {});
-                    await loadChunks(false);
                 } catch (e) { console.error('Cancel error:', e); }
+                // The server resets the in-flight chunks asynchronously, so re-read
+                // a few times instead of leaving 'generating' badges behind.
+                [0, 1200, 3000, 6000].forEach(d => setTimeout(() => loadChunks(false), d));
             }
         };
 
@@ -2714,38 +2824,15 @@
                 const response = await API.post('/api/generate_batch', { indices });
                 console.log(`Batch generation started: ${response.total_chunks} chunks with ${response.workers} workers`);
 
-                // Poll for completion
-                const pollInterval = setInterval(async () => {
-                    if (!isRenderingAll) {
-                        clearInterval(pollInterval);
-                        return;
+                // Watch until every requested chunk is done or failed
+                watchRender(indices, async () => {
+                    const updated = await API.get('/api/chunks');
+                    const completed = updated.filter(c => indices.includes(c.id) && c.status === 'done').length;
+                    const failed = updated.filter(c => indices.includes(c.id) && c.status === 'error').length;
+                    if (failed > 0) {
+                        showToast(`Batch complete: ${completed} succeeded, ${failed} failed`, 'warning');
                     }
-
-                    try {
-                        await loadChunks(false);
-                        const updated = await API.get('/api/chunks');
-                        const stillGenerating = updated.filter(c =>
-                            indices.includes(c.id) && c.status === 'generating'
-                        );
-
-                        if (stillGenerating.length === 0) {
-                            clearInterval(pollInterval);
-                            // Clear highlights
-                            document.querySelectorAll('tr').forEach(r => r.classList.remove('table-info'));
-                            cancelRender(true);
-                            await loadChunks(false);
-
-                            // Show completion summary
-                            const completed = updated.filter(c => indices.includes(c.id) && c.status === 'done').length;
-                            const failed = updated.filter(c => indices.includes(c.id) && c.status === 'error').length;
-                            if (failed > 0) {
-                                showToast(`Batch complete: ${completed} succeeded, ${failed} failed`, 'warning');
-                            }
-                        }
-                    } catch (e) {
-                        console.error("Polling error", e);
-                    }
-                }, 2000);
+                });
 
             } catch (e) {
                 console.error("Render All error:", e);
@@ -2789,36 +2876,15 @@
                 const response = await API.post('/api/generate_batch_fast', { indices });
                 console.log(`Fast batch started: ${response.total_chunks} chunks (batch_size=${response.batch_size}, seed=${response.batch_seed})`);
 
-                // Poll for completion
-                const pollInterval = setInterval(async () => {
-                    if (!isRenderingAll) {
-                        clearInterval(pollInterval);
-                        return;
+                // Watch until every requested chunk is done or failed
+                watchRender(indices, async () => {
+                    const updated = await API.get('/api/chunks');
+                    const completed = updated.filter(c => indices.includes(c.id) && c.status === 'done').length;
+                    const failed = updated.filter(c => indices.includes(c.id) && c.status === 'error').length;
+                    if (failed > 0) {
+                        showToast(`Batch complete: ${completed} succeeded, ${failed} failed`, 'warning');
                     }
-
-                    try {
-                        await loadChunks(false);
-                        const updated = await API.get('/api/chunks');
-                        const stillGenerating = updated.filter(c =>
-                            indices.includes(c.id) && c.status === 'generating'
-                        );
-
-                        if (stillGenerating.length === 0) {
-                            clearInterval(pollInterval);
-                            document.querySelectorAll('tr').forEach(r => r.classList.remove('table-info'));
-                            cancelRender(true);
-                            await loadChunks(false);
-
-                            const completed = updated.filter(c => indices.includes(c.id) && c.status === 'done').length;
-                            const failed = updated.filter(c => indices.includes(c.id) && c.status === 'error').length;
-                            if (failed > 0) {
-                                showToast(`Batch complete: ${completed} succeeded, ${failed} failed`, 'warning');
-                            }
-                        }
-                    } catch (e) {
-                        console.error("Polling error", e);
-                    }
-                }, 2000);
+                });
 
             } catch (e) {
                 console.error("Batch Fast error:", e);

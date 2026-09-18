@@ -288,6 +288,16 @@ class ProjectManager:
             atomic_json_write(chunks, self.chunks_path)
             return chunks[index]
 
+    def set_chunk_status(self, index, status):
+        """Public single-field status write.
+
+        Used to claim a chunk as 'generating' in the request handler, before the
+        background task is scheduled: the worker only starts after the HTTP
+        response is sent, so a client that polls immediately would otherwise see
+        the old status and could stop watching a generation that is underway.
+        """
+        return self._update_chunk_fields(index, status=status)
+
     def insert_chunk(self, after_index):
         """Insert an empty chunk after the given index. Returns the new chunk list."""
         with self._chunks_lock:
@@ -828,6 +838,20 @@ class ProjectManager:
             return results
 
         print(f"Starting parallel generation of {total} chunks with {max_workers} workers...")
+
+        # Claim every target up front. Each worker marks its own chunk when its
+        # thread starts, so without this the chunks all still read 'pending'
+        # right after the request returns and a polling client can conclude that
+        # nothing is running.
+        try:
+            chunks = self.load_chunks()
+            if chunks:
+                for idx in indices:
+                    if 0 <= idx < len(chunks):
+                        chunks[idx]["status"] = "generating"
+                self.save_chunks(chunks)
+        except Exception as e:
+            print(f"Warning: could not pre-mark chunks as generating: {e}")
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {

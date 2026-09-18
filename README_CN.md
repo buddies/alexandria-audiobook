@@ -186,6 +186,7 @@ Web UI 显示的是高层状态，**详细日志在 Pinokio 终端中**：
 - 使用 Custom Voice 时，从 9 个预设中选择（Ryan、Serena、Aiden 等），可选设置角色风格（例如"沉稳的旁白语调"）
 - **Seed（Custom Voice）** — 每张声音卡片都有 Seed 字段，用于固定角色音色。注意：**同一个 seed 只有在预设与 instruct 都相同时才逐字节一致**；只要那一行的 instruct 变了，就等于重新掷了一次音色（验证见下方“角色风格”）。留空（或 `-1`）使用默认的按角色名固定种子；填入数字即可锁定当前满意的音色，或点击骰子按钮换一个 seed 后重新生成某句试听。优先级为：角色固定 seed → Batch Seed（Setup 页，仅 Fast batch 生效）→ 按角色名的稳定种子 → 随机；Editor、批量渲染与试听完全一致地遵循该优先级
 - **试听（Preview）** — 每张卡片的 Preview 按钮会用该卡当前设置（预设、角色风格、seed）生成一句短台词并就地播放，方便在正式渲染前确认音色、挑好固定的 seed。试听台词可在卡片上方的 "Preview line" 中统一填写，留空则使用与 TTS 语言对应的默认台词
+- **试听 = 真实下发的 payload** — 试听必定带上该卡的 Character Style（与正式渲染完全一致）；卡片上方的 **情绪 / 风格** 输入框可为这次试听额外叠加一句逐行 Emotion / Style（仅本次试听，不保存）。播放器下方会打印本次实际发送的字符串（`Sends: …`），可以直接对照听感核对，也能看到 **Emotion Direction Per Line** 策略带来的差异。克隆声音会明确显示不发 instructions（克隆路径本就不接受）
 - **生成角色** — 点击后 LLM 分析脚本，为每个角色创建声音描述、生成参考音频并自动分配克隆声音。切换"Advanced"可控制批量大小。这是为所有角色分配独特声音的最快方式
 - **角色风格（音色锚点）** — 每张声音卡片的 Character Style 字段会被追加到该角色每一行的 instruct 之后，是整条指令里唯一描述"这个人本身"而非"这一句的情绪"的部分。只用声学描述（声音类型、音区、音色、质感、基准语速），不要写情绪或表演词：TTS 会用整条 instruct 重新生成声音，情绪化锚点会直接改变音色
 - **自动生成角色风格** — Setup → Generation Settings 里的 **Auto-generate Character Styles** 默认开启。生成脚本后会顺带让 LLM 为每个角色写一条锚点并写入 `voice_config.json`；**已经填写的 Character Style 不会被覆盖**。也可在声音标签页点 **Generate Character Styles** 手动触发，或用 `python app/generate_character_styles.py --overwrite` 强制重写

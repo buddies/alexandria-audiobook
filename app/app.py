@@ -1206,6 +1206,10 @@ async def voice_preview(request: VoicePreviewRequest):
 
     logger.info(f"Voice preview: speaker='{canonical}' type={voice_data.get('type', 'custom')} "
                 f"voice={voice_data.get('voice')} seed={voice_data.get('seed')}")
+    # What this preview actually sends, so the UI can show it instead of guessing.
+    # Computed before generation: the engine is the single source of truth for how
+    # the instruct policy, the character style and the voice type combine.
+    instructions = engine.preview_instructions(request.instruct or "", voice_data)
     try:
         success = engine.generate_voice(
             text=text,
@@ -1231,6 +1235,8 @@ async def voice_preview(request: VoicePreviewRequest):
         "text": text,
         "language": language,
         "speaker": canonical,
+        "instructions": instructions,
+        "voice_type": voice_data.get("type", "custom"),
     }
 
 @app.get("/api/audiobook")
@@ -1293,10 +1299,19 @@ async def generate_chunk_endpoint(index: int, background_tasks: BackgroundTasks)
     if not chunks[index].get("text", "").strip():
         raise HTTPException(status_code=400, detail="Cannot generate audio for an empty line")
 
+    # Claim the chunk before returning. The background task only starts after the
+    # response is sent, so the Editor's first status poll would otherwise see
+    # 'pending', conclude nothing is running and stop refreshing the row.
+    project_manager.set_chunk_status(index, "generating")
+
     def task():
         project_manager.generate_chunk_audio(index)
 
-    background_tasks.add_task(task)
+    try:
+        background_tasks.add_task(task)
+    except Exception:
+        project_manager.set_chunk_status(index, "pending")
+        raise
     return {"status": "started"}
 
 @app.post("/api/merge")
@@ -1485,7 +1500,18 @@ async def generate_batch_endpoint(request: BatchGenerateRequest, background_task
             process_state["audio"]["running"] = False
             process_state["audio"]["cancel"] = False
 
-    background_tasks.add_task(task)
+    # Publish the task state now: /api/status/audio is what the Editor watches,
+    # and the background task cannot start until this response has been sent.
+    process_state["audio"]["running"] = True
+    process_state["audio"]["cancel"] = False
+    process_state["audio"]["logs"] = [
+        f"Starting parallel generation of {total} chunks with {workers} workers..."
+    ]
+    try:
+        background_tasks.add_task(task)
+    except Exception:
+        process_state["audio"]["running"] = False
+        raise
     return {"status": "started", "workers": workers, "total_chunks": total}
 
 @app.post("/api/generate_batch_fast")
@@ -1552,7 +1578,18 @@ async def generate_batch_fast_endpoint(request: BatchGenerateRequest, background
             process_state["audio"]["running"] = False
             process_state["audio"]["cancel"] = False
 
-    background_tasks.add_task(task)
+    # Publish the task state now: /api/status/audio is what the Editor watches,
+    # and the background task cannot start until this response has been sent.
+    process_state["audio"]["running"] = True
+    process_state["audio"]["cancel"] = False
+    process_state["audio"]["logs"] = [
+        f"Starting batch generation of {total} chunks (batch_size={batch_size}, seed={batch_seed})..."
+    ]
+    try:
+        background_tasks.add_task(task)
+    except Exception:
+        process_state["audio"]["running"] = False
+        raise
     return {"status": "started", "batch_seed": batch_seed, "batch_size": batch_size, "total_chunks": total}
 
 @app.post("/api/cancel_audio")

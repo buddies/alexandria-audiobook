@@ -393,6 +393,35 @@ class TTSEngine:
         instruct = self._style_with_anchor(line, voice_data)
         return instruct or (fallback or "").strip()
 
+    def preview_instructions(self, instruct_text, voice_data):
+        """The `instructions` string a real line would send for this voice.
+
+        Mirrors the per-type behaviour of ``generate_voice`` so the Voices tab can
+        show what a preview (or a render) actually sends instead of re-deriving it
+        in JavaScript. Returns "" when the voice type cannot take a direction at
+        all — a cloned voice ignores instructs, and a design voice uses its
+        description as the whole style prompt.
+        """
+        voice_data = voice_data or {}
+        voice_type = voice_data.get("type", "custom")
+
+        if voice_type == "clone":
+            return ""
+
+        if voice_type == "design":
+            base_desc = (voice_data.get("description") or "").strip()
+            line = (instruct_text or "").strip()
+            if base_desc and line:
+                return f"{base_desc}, {line}"
+            return base_desc or line
+
+        # Local custom voices fall back to "neutral" so the request is never
+        # sent without a direction; the external path leaves it out instead.
+        fallback = (voice_data.get("default_style") or "").strip()
+        if self._mode == "local" and voice_type not in ("lora", "builtin_lora"):
+            fallback = fallback or "neutral"
+        return self._build_instruct(instruct_text, voice_data, fallback=fallback)
+
     @property
     def downloads_enabled(self):
         """Whether this engine is allowed to download model weights.
