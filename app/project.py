@@ -20,6 +20,7 @@ from tts import (
     SAME_SPEAKER_PAUSE_MS
 )
 from pydub import AudioSegment
+from audio_assembly import AudioSegmentBuilder
 
 MAX_CHUNK_CHARS = 500
 
@@ -584,7 +585,7 @@ class ProjectManager:
         speaker_tracks = {}
         for speaker in speakers_ordered:
             track_cursor = 0
-            track = AudioSegment.empty()
+            track = AudioSegmentBuilder(AudioSegment.empty())
 
             for chunk, segment, start_ms in timeline:
                 if chunk["speaker"] != speaker:
@@ -592,16 +593,16 @@ class ProjectManager:
                 # Insert silence gap from current track position to this chunk's start
                 gap = start_ms - track_cursor
                 if gap > 0:
-                    track += AudioSegment.silent(duration=gap)
-                track += segment
+                    track.append(AudioSegment.silent(duration=gap))
+                track.append(segment)
                 track_cursor = start_ms + len(segment)
 
             # Pad to total duration so all tracks are equal length
             remaining = total_duration_ms - track_cursor
             if remaining > 0:
-                track += AudioSegment.silent(duration=remaining)
+                track.append(AudioSegment.silent(duration=remaining))
 
-            speaker_tracks[speaker] = track
+            speaker_tracks[speaker] = track.finish()
 
         # Phase 3 — Build LOF and labels content
         lof_lines = []

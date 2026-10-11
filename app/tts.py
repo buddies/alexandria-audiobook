@@ -7,6 +7,7 @@ import zlib
 import numpy as np
 import soundfile as sf
 from pydub import AudioSegment
+from audio_assembly import AudioSegmentBuilder
 
 DEFAULT_PAUSE_MS = 500  # Pause between different speakers
 SAME_SPEAKER_PAUSE_MS = 250  # Shorter pause for same speaker continuing
@@ -192,7 +193,7 @@ def combine_audio_with_pauses(audio_segments, speakers, pause_ms=DEFAULT_PAUSE_M
             faded.append(segment)
         segments = faded
 
-    combined = segments[0]
+    combined = AudioSegmentBuilder(segments[0])
     prev_speaker = speakers[0]
 
     for i, (segment, speaker) in enumerate(zip(segments[1:], speakers[1:])):
@@ -203,10 +204,10 @@ def combine_audio_with_pauses(audio_segments, speakers, pause_ms=DEFAULT_PAUSE_M
             gap = AudioSegment.silent(duration=same_speaker_pause_ms)
         else:
             gap = AudioSegment.silent(duration=pause_ms)
-        combined += gap + segment
+        combined.append(gap + segment)
         prev_speaker = speaker
 
-    return combined
+    return combined.finish()
 
 
 def compute_timeline(chunks_with_audio, pause_ms=DEFAULT_PAUSE_MS,
